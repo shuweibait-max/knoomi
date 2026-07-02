@@ -184,4 +184,4 @@ initDB()
   .then(() => server.listen(PORT, () =>
     console.log(`🌿 Knoomi API running on http://localhost:${PORT}`)
   ))
-  .catch(err => { console.error('❌ Database init failed:', err.message); process.exit(1); });
+  .catch(err => { console.error('❌ Database init failed:', err); process.exit(1); });
