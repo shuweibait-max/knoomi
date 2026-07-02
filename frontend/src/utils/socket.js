@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // ============================================================
 //  frontend/src/utils/socket.js — production version
 // ============================================================
@@ -16,6 +17,14 @@ export function getSocket() {
       ? io(SOCKET_URL, { autoConnect: false, transports: ['websocket', 'polling'] })
       : io({ autoConnect: false })
   }
+=======
+import { io } from 'socket.io-client'
+
+let socket = null
+
+export function getSocket() {
+  if (!socket) socket = io({ autoConnect: false })
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
   return socket
 }
 

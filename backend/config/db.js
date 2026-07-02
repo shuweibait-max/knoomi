@@ -1,6 +1,7 @@
 const { Pool } = require('pg');
 require('dotenv').config();
 
+<<<<<<< HEAD
 // Render provides a single DATABASE_URL for PostgreSQL.
 // Locally, we use individual DB_HOST, DB_PORT, etc.
 const pool = process.env.DATABASE_URL
@@ -17,6 +18,16 @@ const pool = process.env.DATABASE_URL
       database: process.env.DB_NAME     || 'knoomi',
       max: 10,
     });
+=======
+const pool = new Pool({
+  host:     process.env.DB_HOST     || 'localhost',
+  port:     process.env.DB_PORT     || 5432,
+  user:     process.env.DB_USER     || 'postgres',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME     || 'mindbridge',
+  max: 10,
+});
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 // Translate MySQL-style queries to PostgreSQL syntax
 function translateQuery(text) {
@@ -35,6 +46,10 @@ async function execute(client, text, params) {
 
   const result = await client.query(finalText, params);
 
+<<<<<<< HEAD
+=======
+  // Mimic mysql2's result object for INSERTs so existing route code works
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
   if (isInsert) {
     const insertId = result.rows[0]?.id || null;
     return [{ insertId, affectedRows: result.rowCount }, result.fields];

@@ -22,6 +22,7 @@ const { runDailyMoodJudgement } = require('./services/moodJudge');
 
 const app    = express();
 const server = http.createServer(app);
+<<<<<<< HEAD
 const io = new Server(server, {
   cors: {
   origin: [
@@ -31,18 +32,34 @@ const io = new Server(server, {
   ].filter(Boolean),
   methods: ['GET', 'POST'],
   credentials: true,
+=======
+const io     = new Server(server, {
+  cors: {
+    origin: [
+      process.env.FRONTEND_URL || 'http://localhost:5173',
+      'http://localhost:5000',
+    ],
+    methods: ['GET', 'POST'],
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
   },
 });
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({
   origin: [
+<<<<<<< HEAD
   process.env.FRONTEND_URL,
   'http://localhost:5173',
   'http://localhost:5000',
   ].filter(Boolean),  // filter removes undefined values
   credentials: true,
   }));
+=======
+    process.env.FRONTEND_URL || 'http://localhost:5173',
+    'http://localhost:5000',
+  ],
+}));
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 app.use(express.json());
 
 // ── API Routes ────────────────────────────────────────────────────────────────
@@ -182,6 +199,12 @@ app.post('/api/admin/run-mood-judgement', async (req, res) => {
 const PORT = process.env.PORT || 5000;
 initDB()
   .then(() => server.listen(PORT, () =>
+<<<<<<< HEAD
     console.log(`🌿 Knoomi API running on http://localhost:${PORT}`)
   ))
   .catch(err => { console.error('❌ Database init failed:', err); process.exit(1); });
+=======
+    console.log(`🌿 MindBridge API running on http://localhost:${PORT}`)
+  ))
+  .catch(err => { console.error('❌ Database init failed:', err.message); process.exit(1); });
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48

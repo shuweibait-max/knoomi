@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 // ============================================================
 //  frontend/src/utils/api.js — production version
 // ============================================================
@@ -12,12 +13,23 @@ const BASE_URL = import.meta.env.VITE_API_URL
 
 const api = axios.create({ baseURL: BASE_URL })
 
+=======
+import axios from 'axios'
+
+const api = axios.create({ baseURL: '/api' })
+
+// Attach JWT to every request
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 api.interceptors.request.use(config => {
   const token = localStorage.getItem('mb_token')
   if (token) config.headers.Authorization = `Bearer ${token}`
   return config
 })
 
+<<<<<<< HEAD
+=======
+// Auto-logout on 401
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 api.interceptors.response.use(
   res => res,
   err => {

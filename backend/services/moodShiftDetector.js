@@ -1,5 +1,9 @@
 // ============================================================
+<<<<<<< HEAD
 //  Knoomi — Mood Shift Detector
+=======
+//  MindBridge — Mood Shift Detector
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 //  Location: /backend/services/moodShiftDetector.js
 //
 //  After each AI reply, this checks whether the user's emotional
@@ -16,7 +20,11 @@ const CHECK_EVERY_N_TURNS   = 4;
 // Minimum messages needed before running the check
 const MIN_TURNS_BEFORE_CHECK = 6;
 
+<<<<<<< HEAD
 const DETECTOR_SYSTEM_PROMPT = `You are a mental health signal analyzer for the Knoomi platform. Your job is to detect emotional deterioration during a conversation between a user and an AI companion.
+=======
+const DETECTOR_SYSTEM_PROMPT = `You are a mental health signal analyzer for the MindBridge platform. Your job is to detect emotional deterioration during a conversation between a user and an AI companion.
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 You will be given the most recent chat messages. Analyze the trajectory of the user's emotional state — NOT their absolute mood, but how it has SHIFTED over the conversation.
 

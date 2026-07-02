@@ -15,7 +15,11 @@ export default function Navbar() {
 
   const title = Object.entries(PAGE_TITLES).find(([path]) =>
     path === '/' ? location.pathname === '/' : location.pathname.startsWith(path)
+<<<<<<< HEAD
   )?.[1] ?? 'Knoomi'
+=======
+  )?.[1] ?? 'MindBridge'
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
   return (
     <header className="h-14 bg-white border-b border-slate-200 flex items-center px-6 shrink-0">

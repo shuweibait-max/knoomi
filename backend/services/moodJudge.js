@@ -1,5 +1,9 @@
 // ============================================================
+<<<<<<< HEAD
 //  Knoomi — Daily Mood Judgement Service
+=======
+//  MindBridge — Daily Mood Judgement Service
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 //  Location: /backend/services/moodJudge.js
 //
 //  Runs nightly at 00:00 (server time). For each user with any
@@ -14,7 +18,11 @@ const { GoogleGenAI } = require('@google/genai');
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = 'gemini-2.5-flash';
 
+<<<<<<< HEAD
 const JUDGE_SYSTEM_PROMPT = `You are Mira's analytical partner — an assistant that reads a user's day of interactions with the Knoomi mental health platform and produces an honest, compassionate summary of their emotional state.
+=======
+const JUDGE_SYSTEM_PROMPT = `You are Mira's analytical partner — an assistant that reads a user's day of interactions with the MindBridge mental health platform and produces an honest, compassionate summary of their emotional state.
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 Your task:
 Given (1) their chat messages with Mira today and (2) any mood scores they logged themselves today, produce a single JSON object with:

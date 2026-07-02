@@ -32,7 +32,11 @@ export default function LoginPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-slate-800">Welcome back</h1>
+<<<<<<< HEAD
           <p className="text-slate-500 text-sm mt-1">Sign in to Knoomi</p>
+=======
+          <p className="text-slate-500 text-sm mt-1">Sign in to MindBridge</p>
+>>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
         </div>
 
         <div className="card p-6">
