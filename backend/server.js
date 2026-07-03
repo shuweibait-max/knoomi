@@ -8,13 +8,13 @@ const jwt        = require('jsonwebtoken');
 const pool       = require('./config/db');
 const initDB     = require('./config/initDB');
 
-const adminRoutes = require('./routes/admin');
-const authRoutes   = require('./routes/auth');
-const chatRoutes   = require('./routes/chat');
-const groupRoutes  = require('./routes/groups');
-const moodRoutes   = require('./routes/mood');
-const videoRoutes  = require('./routes/video');
-const crisisRoutes = require('./routes/crisis');
+const adminRoutes         = require('./routes/admin');
+const authRoutes          = require('./routes/auth');
+const chatRoutes          = require('./routes/chat');
+const groupRoutes         = require('./routes/groups');
+const moodRoutes          = require('./routes/mood');
+const videoRoutes         = require('./routes/video');
+const crisisRoutes        = require('./routes/crisis');
 const notificationsRoutes = require('./routes/notifications');
 
 const cron = require('node-cron');
@@ -22,59 +22,40 @@ const { runDailyMoodJudgement } = require('./services/moodJudge');
 
 const app    = express();
 const server = http.createServer(app);
-<<<<<<< HEAD
-const io = new Server(server, {
-  cors: {
-  origin: [
+
+// ── Allowed origins for CORS (dev + production) ──────────────────────────────
+const allowedOrigins = [
   process.env.FRONTEND_URL,
   'http://localhost:5173',
   'http://localhost:5000',
-  ].filter(Boolean),
-  methods: ['GET', 'POST'],
-  credentials: true,
-=======
-const io     = new Server(server, {
+].filter(Boolean);   // remove undefined values
+
+const io = new Server(server, {
   cors: {
-    origin: [
-      process.env.FRONTEND_URL || 'http://localhost:5173',
-      'http://localhost:5000',
-    ],
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
+    credentials: true,
   },
 });
 
 // ── Middleware ────────────────────────────────────────────────────────────────
 app.use(cors({
-  origin: [
-<<<<<<< HEAD
-  process.env.FRONTEND_URL,
-  'http://localhost:5173',
-  'http://localhost:5000',
-  ].filter(Boolean),  // filter removes undefined values
+  origin: allowedOrigins,
   credentials: true,
-  }));
-=======
-    process.env.FRONTEND_URL || 'http://localhost:5173',
-    'http://localhost:5000',
-  ],
 }));
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 app.use(express.json());
 
 // ── API Routes ────────────────────────────────────────────────────────────────
-app.use('/api/admin', adminRoutes);
-app.use('/api/auth',   authRoutes);
-app.use('/api/chat',   chatRoutes);
-app.use('/api/groups', groupRoutes);
-app.use('/api/mood',   moodRoutes);
-app.use('/api/video',  videoRoutes);
-app.use('/api/crisis', crisisRoutes);
+app.use('/api/admin',         adminRoutes);
+app.use('/api/auth',          authRoutes);
+app.use('/api/chat',          chatRoutes);
+app.use('/api/groups',        groupRoutes);
+app.use('/api/mood',          moodRoutes);
+app.use('/api/video',         videoRoutes);
+app.use('/api/crisis',        crisisRoutes);
 app.use('/api/notifications', notificationsRoutes);
 
 // ── Serve React build in production ──────────────────────────────────────────
-// In development, Vite runs its own dev server on port 5173.
-// In production (after `npm run build`), serve the built files.
 const frontendBuild = path.join(__dirname, '..', 'frontend', 'dist');
 if (require('fs').existsSync(frontendBuild)) {
   app.use(express.static(frontendBuild));
@@ -168,8 +149,7 @@ io.on('connection', (socket) => {
   });
 });
 
-//──────Cron job for daily mood judgement ──────────────────────────────────────────────────────────────
-
+// ── Cron job for daily mood judgement ────────────────────────────────────────
 cron.schedule('0 0 * * *', async () => {
   console.log('⏰ Midnight mood judgement job triggered');
   try {
@@ -178,15 +158,14 @@ cron.schedule('0 0 * * *', async () => {
     console.error('❌ Mood judgement job failed:', err);
   }
 }, {
-  timezone: 'Asia/Kuala_Lumpur',   // Malaysia time — change if needed
+  timezone: 'Asia/Kuala_Lumpur',
 });
- 
+
 console.log('📅 Daily mood judgement scheduled for 00:00 Asia/Kuala_Lumpur');
 
 // Test endpoint — POST /api/admin/run-mood-judgement
 app.post('/api/admin/run-mood-judgement', async (req, res) => {
   try {
-    // Optionally accept a specific date via body: { date: '2026-07-01' }
     const targetDate = req.body?.date ? new Date(req.body.date) : null;
     const result = await runDailyMoodJudgement(pool, targetDate);
     res.json({ message: 'Judgement complete', ...result });
@@ -199,12 +178,6 @@ app.post('/api/admin/run-mood-judgement', async (req, res) => {
 const PORT = process.env.PORT || 5000;
 initDB()
   .then(() => server.listen(PORT, () =>
-<<<<<<< HEAD
     console.log(`🌿 Knoomi API running on http://localhost:${PORT}`)
   ))
   .catch(err => { console.error('❌ Database init failed:', err); process.exit(1); });
-=======
-    console.log(`🌿 MindBridge API running on http://localhost:${PORT}`)
-  ))
-  .catch(err => { console.error('❌ Database init failed:', err.message); process.exit(1); });
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
