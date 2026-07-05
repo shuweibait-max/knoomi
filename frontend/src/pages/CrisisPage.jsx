@@ -81,11 +81,7 @@ export default function CrisisPage({ standalone }) {
 
         {standalone && (
           <div className="text-center mt-6">
-<<<<<<< HEAD
             <Link to="/login" className="text-sm text-slate-500 hover:underline">← Back to Knoomi</Link>
-=======
-            <Link to="/login" className="text-sm text-slate-500 hover:underline">← Back to MindBridge</Link>
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
           </div>
         )}
       </div>

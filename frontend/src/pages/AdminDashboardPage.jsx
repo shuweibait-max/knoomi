@@ -292,11 +292,7 @@ export default function AdminDashboardPage() {
             <h1 className="text-xl font-bold text-slate-800">Admin Dashboard</h1>
             <span className="bg-purple-100 text-purple-700 text-xs px-2 py-0.5 rounded-full font-bold">ADMIN</span>
           </div>
-<<<<<<< HEAD
           <p className="text-slate-500 text-sm">Knoomi platform oversight</p>
-=======
-          <p className="text-slate-500 text-sm">MindBridge platform oversight</p>
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
         </div>
         <div className="text-right text-xs text-slate-400">
           Signed in as<br />

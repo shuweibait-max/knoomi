@@ -29,11 +29,7 @@ const ACTION_ICONS = {
 }
 
 const ACTIONS = [
-<<<<<<< HEAD
   { to: '/chat',   iconKey: 'chat',   title: 'Talk to AI',     desc: 'Chat with Knoomi AI' },
-=======
-  { to: '/chat',   iconKey: 'chat',   title: 'Talk to AI',     desc: 'Chat with MindBridge AI' },
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
   { to: '/groups', iconKey: 'groups', title: 'Group Therapy',  desc: 'Join a support group' },
   { to: '/mood',   iconKey: 'mood',   title: 'Log Mood',       desc: 'Track how you feel' },
   { to: '/video',  iconKey: 'video',  title: 'Video Session',  desc: 'Meet with a therapist' },

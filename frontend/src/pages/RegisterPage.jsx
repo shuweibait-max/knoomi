@@ -33,11 +33,7 @@ export default function RegisterPage() {
             </svg>
           </div>
           <h1 className="text-2xl font-bold text-slate-800">Create your account</h1>
-<<<<<<< HEAD
           <p className="text-slate-500 text-sm mt-1">Join Knoomi — it's free</p>
-=======
-          <p className="text-slate-500 text-sm mt-1">Join MindBridge — it's free</p>
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
         </div>
 
         <div className="card p-6">
