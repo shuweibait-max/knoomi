@@ -1,8 +1,4 @@
-<<<<<<< HEAD
 # 🌿 Knoomi — Mental Health Support Web App
-=======
-# 🌿 MindBridge — Mental Health Support Web App
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 Full-stack mental health platform built with React (frontend) and Node.js/Express (backend), designed for easy migration to React Native.
 
@@ -25,11 +21,7 @@ Full-stack mental health platform built with React (frontend) and Node.js/Expres
 ## Project Structure
 
 ```
-<<<<<<< HEAD
 knoomi/
-=======
-mindbridge/
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 ├── backend/
 │   ├── config/
 │   │   ├── db.js          # PostgreSQL connection pool
@@ -86,19 +78,11 @@ mindbridge/
 
 ### 1. Create the database
 
-<<<<<<< HEAD
 Open pgAdmin 4 → right-click Databases → Create → name it `knoomi`.
 
 Or in PowerShell:
 ```powershell
 & "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -c "CREATE DATABASE knoomi;"
-=======
-Open pgAdmin 4 → right-click Databases → Create → name it `mindbridge`.
-
-Or in PowerShell:
-```powershell
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -c "CREATE DATABASE mindbridge;"
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 ```
 
 ---

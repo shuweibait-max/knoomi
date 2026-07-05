@@ -195,11 +195,7 @@ router.post('/welcome', auth, async (req, res) => {
     const userName = context.userName || 'there';
  
     // Build a short, warm welcome prompt
-<<<<<<< HEAD
     const welcomeSystemPrompt = `You are ${aiName}, a warm and compassionate AI companion on Knoomi — a mental health platform for young adults in Malaysia and Southeast Asia.
-=======
-    const welcomeSystemPrompt = `You are ${aiName}, a warm and compassionate AI companion on MindBridge — a mental health platform for young adults in Malaysia and Southeast Asia.
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
  
 This is the very first time you are meeting ${userName}. Write a warm, brief opening message (2–3 sentences max) that:
 - Introduces yourself by name gently ("Hi ${userName}, I'm ${aiName}...")

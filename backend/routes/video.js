@@ -9,11 +9,7 @@ const router = express.Router();
 // POST /api/video/create
 router.post('/create', auth, async (req, res) => {
   const { participant_id = null } = req.body;
-<<<<<<< HEAD
   const roomName = `knoomi-${uuidv4().replace(/-/g,'').slice(0,12)}`;
-=======
-  const roomName = `mindbridge-${uuidv4().replace(/-/g,'').slice(0,12)}`;
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
   let dailyUrl   = `https://${process.env.DAILY_DOMAIN}/${roomName}`;
 
   // Create room on Daily.co if keys are set

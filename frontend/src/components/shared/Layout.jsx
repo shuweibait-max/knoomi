@@ -31,11 +31,7 @@ export default function Layout() {
     <div className="flex h-screen overflow-hidden bg-slate-50">
       <aside className="w-56 bg-white border-r border-slate-200 flex flex-col shrink-0">
         <div className="px-5 py-5 border-b border-slate-100">
-<<<<<<< HEAD
           <div className="text-brand-600 font-bold text-base">🌿 Knoomi</div>
-=======
-          <div className="text-brand-600 font-bold text-base">🌿 MindBridge</div>
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
           <div className="text-xs text-slate-400 mt-0.5">Mental Health Support</div>
         </div>
 

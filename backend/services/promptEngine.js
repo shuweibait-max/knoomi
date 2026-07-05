@@ -1,9 +1,5 @@
 // ============================================================
-<<<<<<< HEAD
 //  Knoomi — Therapy Prompt Engine
-=======
-//  MindBridge — Therapy Prompt Engine
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 //  Location: /backend/services/promptEngine.js
 // ============================================================
 
@@ -48,28 +44,17 @@ function buildSystemPrompt(context = {}) {
 
   const moodContext = recentMoodAvg
     ? `
-<<<<<<< HEAD
 CURRENT USER CONTEXT (from Knoomi mood tracker — use this to personalise your responses):
 - Recent average mood score: ${recentMoodAvg}/10 (${recentMoodTrend ?? "no trend data"})
 - They have had approximately ${sessionCount} previous session(s) with you
 - They ${hasTherapist ? "have a therapist session booked through Knoomi" : "do not currently have a therapist session booked"}
-=======
-CURRENT USER CONTEXT (from MindBridge mood tracker — use this to personalise your responses):
-- Recent average mood score: ${recentMoodAvg}/10 (${recentMoodTrend ?? "no trend data"})
-- They have had approximately ${sessionCount} previous session(s) with you
-- They ${hasTherapist ? "have a therapist session booked through MindBridge" : "do not currently have a therapist session booked"}
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 Use this context subtly — do not announce that you are reading their data. If their mood has been declining, be especially warm and check in gently early in the conversation.
 `
     : "";
 
   return `
-<<<<<<< HEAD
 You are ${aiName}, a warm and compassionate AI support companion for Knoomi — a mental health platform serving Malaysian university students and young adults in Southeast Asia.
-=======
-You are ${aiName}, a warm and compassionate AI support companion for MindBridge — a mental health platform serving Malaysian university students and young adults in Southeast Asia.
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 ═══════════════════════════════════════════
 WHO YOU ARE
@@ -131,13 +116,8 @@ WHAT YOU MUST NEVER DO
 BOUNDARIES
 ═══════════════════════════════════════════
 ${hasTherapist
-<<<<<<< HEAD
   ? "This user has a therapist session booked through Knoomi. You can occasionally reference this: 'This might be worth bringing up with your therapist too.'"
   : "If the conversation touches on something that needs professional support: 'It might really help to talk to a counsellor — Knoomi lets you book a session with a licensed therapist if you ever feel ready.'"}
-=======
-  ? "This user has a therapist session booked through MindBridge. You can occasionally reference this: 'This might be worth bringing up with your therapist too.'"
-  : "If the conversation touches on something that needs professional support: 'It might really help to talk to a counsellor — MindBridge lets you book a session with a licensed therapist if you ever feel ready.'"}
->>>>>>> 25715433bb13ee2baeb33eb1d9914574e804fc48
 
 ═══════════════════════════════════════════
 CRISIS PROTOCOL — NON-NEGOTIABLE
