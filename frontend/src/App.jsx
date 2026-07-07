@@ -13,6 +13,7 @@ import CrisisPage   from './pages/CrisisPage'
 import ProfilePage  from './pages/ProfilePage'
 import AdminDashboardPage  from './pages/AdminDashboardPage'
 import AdminUserDetailPage from './pages/AdminUserDetailPage'
+import InvitePage from './pages/InvitePage'
 
 
 function PrivateRoute({ children }) {
@@ -53,6 +54,7 @@ export default function App() {
             <Route path="profile"     element={<ProfilePage />} />
             <Route path="admin"           element={<AdminDashboardPage />} />
             <Route path="admin/users/:id" element={<AdminUserDetailPage />} />
+            <Route path="/invite/:code" element={<InvitePage />} />
           </Route>
         </Routes>
       </BrowserRouter>

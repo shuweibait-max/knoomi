@@ -12,15 +12,24 @@ export default function LoginPage() {
   const handleChange = e => setForm(f => ({ ...f, [e.target.name]: e.target.value }))
 
   const handleSubmit = async e => {
-    e.preventDefault()
-    setError(''); setLoading(true)
-    try {
-      await login(form.email, form.password)
+  e.preventDefault()
+  setError(''); setLoading(true)
+  try {
+    await login(form.email, form.password)
+ 
+    // ─── NEW: handle pending invite ─────
+    const pendingInvite = sessionStorage.getItem('pending_invite')
+    if (pendingInvite) {
+      sessionStorage.removeItem('pending_invite')
+      navigate(`/invite/${pendingInvite}`)
+    } else {
       navigate('/')
-    } catch (err) {
-      setError(err.response?.data?.error || 'Login failed. Please try again.')
-    } finally { setLoading(false) }
-  }
+    }
+    // ─── END NEW ─────
+  } catch (err) {
+    setError(err.response?.data?.error || 'Login failed. Please try again.')
+  } finally { setLoading(false) }
+}
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-slate-100 px-4">

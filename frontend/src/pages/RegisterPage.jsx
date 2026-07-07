@@ -12,16 +12,23 @@ export default function RegisterPage() {
   const handleChange = e => setForm(f => ({ ...f, [e.target.name]: e.target.value }))
 
   const handleSubmit = async e => {
-    e.preventDefault()
-    if (form.password.length < 8) { setError('Password must be at least 8 characters'); return }
-    setError(''); setLoading(true)
-    try {
-      await register(form.username, form.email, form.password, form.role)
+  e.preventDefault()
+  if (form.password.length < 8) { setError('Password must be at least 8 characters'); return }
+  setError(''); setLoading(true)
+  try {
+    await register(form.username, form.email, form.password, form.role)
+ 
+    const pendingInvite = sessionStorage.getItem('pending_invite')
+    if (pendingInvite) {
+      sessionStorage.removeItem('pending_invite')
+      navigate(`/invite/${pendingInvite}`)
+    } else {
       navigate('/')
-    } catch (err) {
-      setError(err.response?.data?.error || 'Registration failed.')
-    } finally { setLoading(false) }
-  }
+    }
+  } catch (err) {
+    setError(err.response?.data?.error || 'Registration failed.')
+  } finally { setLoading(false) }
+}
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-brand-50 to-slate-100 px-4">
