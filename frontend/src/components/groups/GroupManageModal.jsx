@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import api from '../utils/api'
+import api from '../../utils/api'
 
 const ROLE_BADGE = {
   owner:  { icon: '👑', label: 'Owner', color: 'bg-amber-50 text-amber-700' },
