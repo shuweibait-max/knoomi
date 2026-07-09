@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import api from '../utils/api'
 import { connectSocket, getSocket } from '../utils/socket'
 import { useAuth } from '../context/AuthContext'
+import GroupManageModal from '../components/groups/GroupManageModal'
 
 export default function GroupRoomPage() {
   const { id }   = useParams()
@@ -13,11 +14,17 @@ export default function GroupRoomPage() {
   const [input,     setInput]     = useState('')
   const [groupInfo, setGroupInfo] = useState(null)
   const [typing,    setTyping]    = useState('')
+  const [showManage, setShowManage] = useState(false)
   const bottomRef  = useRef(null)
   const typingTimer = useRef(null)
 
+  const loadGroupInfo = () => {
+    api.get('/groups/mine')
+      .then(r => setGroupInfo(r.data.find(g => g.id === groupId)))
+      .catch(() => {})
+  }
+
   useEffect(() => {
-    // Load history + group info
     Promise.all([
       api.get(`/groups/${groupId}/messages`),
       api.get('/groups/mine'),
@@ -26,7 +33,6 @@ export default function GroupRoomPage() {
       setGroupInfo(groupRes.data.find(g => g.id === groupId))
     }).catch(() => navigate('/groups'))
 
-    // Socket
     const socket = connectSocket()
     const token  = localStorage.getItem('mb_token')
     socket.emit('join_group_room', { token, group_id: groupId })
@@ -67,21 +73,43 @@ export default function GroupRoomPage() {
 
   const leaveGroup = async () => {
     if (!confirm('Leave this group?')) return
-    const token = localStorage.getItem('mb_token')
-    getSocket()?.emit('leave_group_room', { token, group_id: groupId })
-    await api.delete(`/groups/${groupId}/leave`)
-    navigate('/groups')
+    try {
+      const token = localStorage.getItem('mb_token')
+      getSocket()?.emit('leave_group_room', { token, group_id: groupId })
+      await api.delete(`/groups/${groupId}/leave`)
+      navigate('/groups')
+    } catch (err) {
+      alert(err.response?.data?.error || 'Could not leave group')
+    }
   }
+
+  const myRole = groupInfo?.my_role
+  const roleBadge = myRole === 'owner'
+    ? <span className="text-xs bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full">👑 Owner</span>
+    : myRole === 'admin'
+    ? <span className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full">🛡️ Admin</span>
+    : null
 
   return (
     <div className="flex flex-col h-screen">
       {/* Header */}
       <div className="bg-white border-b border-slate-200 px-5 py-3.5 flex items-center justify-between shrink-0">
         <div>
-          <div className="font-bold text-slate-800 text-sm">{groupInfo?.name || 'Group Room'}</div>
+          <div className="font-bold text-slate-800 text-sm flex items-center gap-2">
+            {groupInfo?.name || 'Group Room'}
+            {roleBadge}
+          </div>
           <div className="text-xs text-slate-400">{groupInfo?.topic} · {groupInfo?.member_count} members</div>
         </div>
-        <button onClick={leaveGroup} className="text-xs text-red-400 hover:text-red-600 transition-colors">Leave</button>
+        <div className="flex items-center gap-3">
+          <button onClick={() => setShowManage(true)}
+            className="text-xs text-slate-500 hover:text-brand-600 font-medium transition-colors">
+            Members
+          </button>
+          {myRole !== 'owner' && (
+            <button onClick={leaveGroup} className="text-xs text-red-400 hover:text-red-600 transition-colors">Leave</button>
+          )}
+        </div>
       </div>
 
       {/* Messages */}
@@ -120,6 +148,17 @@ export default function GroupRoomPage() {
           <button onClick={sendMessage} disabled={!input.trim()} className="btn-primary px-5">Send</button>
         </div>
       </div>
+
+      {showManage && groupInfo && (
+        <GroupManageModal
+          group={groupInfo}
+          currentUserId={user?.id}
+          myRole={myRole}
+          onClose={() => setShowManage(false)}
+          onGroupUpdated={(updated) => setGroupInfo(g => ({ ...g, ...updated }))}
+          onGroupDeleted={() => setShowManage(false)}
+        />
+      )}
     </div>
   )
 }
