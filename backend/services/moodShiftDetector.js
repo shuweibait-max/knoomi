@@ -8,8 +8,10 @@
 // ============================================================
 
 const { GoogleGenAI } = require('@google/genai');
+const { admin }       = require('../config/firebase');
 const ai              = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL           = 'gemini-2.5-flash';
+const FieldValue      = admin.firestore.FieldValue;
 
 // Only re-check after every N user messages to save API calls
 const CHECK_EVERY_N_TURNS   = 4;
@@ -102,7 +104,7 @@ function shouldRunDetection(historyMessages) {
  * Inserts notifications for the user AND for admin review.
  * Returns the user-facing notification so it can be attached to the chat response.
  */
-async function createShiftNotifications(pool, userId, shift, isCrisis = false) {
+async function createShiftNotifications(db, uid, shift, isCrisis = false) {
   const severity = isCrisis ? 'urgent' : shift.severity;
 
   // ── User notification (gentle, supportive) ────────────────
@@ -112,32 +114,33 @@ async function createShiftNotifications(pool, userId, shift, isCrisis = false) {
     ? 'I noticed some heavier feelings coming up'
     : 'Just checking in';
 
-  const userMeta = {
-    from_mood: shift.from_mood,
-    to_mood:   shift.to_mood,
-    signals:   shift.signals,
-  };
-
-  await pool.query(
-    `INSERT INTO notifications (user_id, audience, type, severity, title, message, metadata)
-     VALUES (?, 'user', 'mood_shift', ?, ?, ?, ?)`,
-    [userId, severity, userTitle, shift.summary, JSON.stringify(userMeta)]
-  );
+  await db.collection('notifications').add({
+    userId: uid,
+    audience: 'user',
+    type: 'mood_shift',
+    severity,
+    title: userTitle,
+    message: shift.summary,
+    metadata: { from_mood: shift.from_mood, to_mood: shift.to_mood, signals: shift.signals },
+    isRead: false,
+    createdAt: FieldValue.serverTimestamp(),
+  });
 
   // ── Admin notification (concise clinical log) ─────────────
-  const adminTitle = `Mood shift detected — user ${userId}`;
-  const adminMessage = `User ${userId} showed a ${severity} mood shift during AI chat. From ~${shift.from_mood}/10 to ~${shift.to_mood}/10. Signals: ${shift.signals.join(', ') || 'none'}. ${isCrisis ? '⚠️ CRISIS LANGUAGE DETECTED. Consider outreach.' : ''}`;
+  const adminTitle = `Mood shift detected — user ${uid}`;
+  const adminMessage = `User ${uid} showed a ${severity} mood shift during AI chat. From ~${shift.from_mood}/10 to ~${shift.to_mood}/10. Signals: ${shift.signals.join(', ') || 'none'}. ${isCrisis ? '⚠️ CRISIS LANGUAGE DETECTED. Consider outreach.' : ''}`;
 
-  await pool.query(
-    `INSERT INTO notifications (user_id, audience, type, severity, title, message, metadata)
-     VALUES (?, 'admin', 'mood_shift', ?, ?, ?, ?)`,
-    [userId, severity, adminTitle, adminMessage, JSON.stringify({
-      from_mood: shift.from_mood,
-      to_mood:   shift.to_mood,
-      signals:   shift.signals,
-      is_crisis: isCrisis,
-    })]
-  );
+  await db.collection('notifications').add({
+    userId: uid,
+    audience: 'admin',
+    type: 'mood_shift',
+    severity,
+    title: adminTitle,
+    message: adminMessage,
+    metadata: { from_mood: shift.from_mood, to_mood: shift.to_mood, signals: shift.signals, is_crisis: isCrisis },
+    isRead: false,
+    createdAt: FieldValue.serverTimestamp(),
+  });
 
   // Return the user notification data to attach to chat response
   return {

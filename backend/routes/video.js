@@ -1,10 +1,11 @@
 const express = require('express');
 const axios   = require('axios');
 const { v4: uuidv4 } = require('uuid');
-const pool    = require('../config/db');
+const { db, admin } = require('../config/firebase');
 const auth    = require('../middleware/auth');
 
 const router = express.Router();
+const FieldValue = admin.firestore.FieldValue;
 
 // POST /api/video/create
 router.post('/create', auth, async (req, res) => {
@@ -34,11 +35,15 @@ router.post('/create', auth, async (req, res) => {
   }
 
   try {
-    const [result] = await pool.query(
-      'INSERT INTO video_sessions (room_name, host_id, participant_id, daily_room_url) VALUES (?, ?, ?, ?)',
-      [roomName, req.userId, participant_id, dailyUrl]
-    );
-    res.status(201).json({ id: result.insertId, room_name: roomName, daily_room_url: dailyUrl });
+    const ref = await db.collection('videoSessions').add({
+      roomName,
+      hostId: req.uid,
+      participantId: participant_id,
+      dailyRoomUrl: dailyUrl,
+      startedAt: FieldValue.serverTimestamp(),
+      endedAt: null,
+    });
+    res.status(201).json({ id: ref.id, room_name: roomName, daily_room_url: dailyUrl });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -47,10 +52,9 @@ router.post('/create', auth, async (req, res) => {
 // PATCH /api/video/:id/end
 router.patch('/:id/end', auth, async (req, res) => {
   try {
-    await pool.query(
-      'UPDATE video_sessions SET ended_at = NOW() WHERE id = ?',
-      [parseInt(req.params.id)]
-    );
+    await db.collection('videoSessions').doc(req.params.id).update({
+      endedAt: FieldValue.serverTimestamp(),
+    });
     res.json({ message: 'Session ended' });
   } catch (err) {
     res.status(500).json({ error: err.message });

@@ -1,0 +1,97 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function userRole() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role;
+    }
+
+    function isAdminOrTherapist() {
+      return isSignedIn() && userRole() in ['admin', 'therapist'];
+    }
+
+    function isGroupMember(groupId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    // ── users ──────────────────────────────────────────────
+    // Profile docs are created/updated by the backend (Admin SDK, which
+    // bypasses these rules entirely) via POST /auth/profile-init and
+    // PUT /auth/profile — client-direct writes are locked down here so a
+    // user can't forge their own profile or self-promote their role.
+    match /users/{uid} {
+      allow read: if isSelf(uid) || isAdminOrTherapist();
+      allow create, delete: if false;
+      allow update: if isSelf(uid) &&
+        !('role' in request.resource.data.diff(resource.data).affectedKeys());
+
+      match /moodEntries/{entryId} {
+        allow read, write: if isSelf(uid) || isAdminOrTherapist();
+      }
+
+      match /aiMessages/{messageId} {
+        allow read, write: if isSelf(uid);
+      }
+    }
+
+    // ── username uniqueness lookup — backend only ───────────
+    match /usernames/{name} {
+      allow read: if true;
+      allow write: if false;
+    }
+
+    // ── invite code lookup — backend only ───────────────────
+    match /inviteCodes/{code} {
+      allow read, write: if false;
+    }
+
+    // ── groups — CRUD/membership stays backend-mediated for
+    //    auditability; only chat reads/sends go client-direct ─
+    match /groups/{groupId} {
+      allow read: if resource.data.isPrivate == false || isGroupMember(groupId);
+      allow write: if false;
+
+      match /members/{uid} {
+        allow read: if isGroupMember(groupId);
+        allow write: if false;
+      }
+
+      match /messages/{messageId} {
+        allow read: if isGroupMember(groupId);
+        allow create: if isGroupMember(groupId)
+          && request.resource.data.senderId == request.auth.uid;
+        allow update, delete: if false;
+      }
+    }
+
+    // ── direct messages — deterministic uid-pair doc id ─────
+    match /dms/{dmId}/messages/{messageId} {
+      allow read, create: if isSignedIn() && request.auth.uid in dmId.split('_');
+      allow update, delete: if false;
+    }
+
+    // ── notifications — backend (Admin SDK) writes only ─────
+    match /notifications/{id} {
+      allow read: if isSignedIn() &&
+        ((resource.data.audience == 'user' && resource.data.userId == request.auth.uid) ||
+         (resource.data.audience == 'admin' && isAdminOrTherapist()));
+      allow write: if false;
+    }
+
+    // ── video sessions — backend (Admin SDK) writes only ────
+    match /videoSessions/{sessionId} {
+      allow read: if isSignedIn() &&
+        (resource.data.hostId == request.auth.uid || resource.data.participantId == request.auth.uid);
+      allow write: if false;
+    }
+  }
+}

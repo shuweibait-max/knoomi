@@ -1,6 +1,6 @@
 const express = require('express');
 const { GoogleGenAI } = require('@google/genai');
-const pool = require('../config/db');
+const { db, admin } = require('../config/firebase');
 const auth = require('../middleware/auth');
 const {
   buildSystemPrompt,
@@ -18,6 +18,7 @@ const {
 const router = express.Router();
 const ai     = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL  = 'gemini-2.5-flash';
+const FieldValue = admin.firestore.FieldValue;
 
 
 function convertToGeminiFormat(messages) {
@@ -36,6 +37,11 @@ function convertToGeminiFormat(messages) {
   return { systemInstruction, contents };
 }
 
+// Deterministic path for a 1:1 DM thread between two uids.
+function dmId(uidA, uidB) {
+  return [uidA, uidB].sort().join('_');
+}
+
 
 // POST /api/chat/ai
 router.post('/ai', auth, async (req, res) => {
@@ -47,29 +53,21 @@ router.post('/ai', auth, async (req, res) => {
     // 1. Crisis detection on user's message
     const { isCrisis, matchedKeywords } = detectCrisis(message);
     if (isCrisis) {
-      console.log(`[CRISIS DETECTED] user=${req.userId}, keywords=${matchedKeywords.join(', ')}`);
+      console.log(`[CRISIS DETECTED] user=${req.uid}, keywords=${matchedKeywords.join(', ')}`);
     }
 
+    const aiMessagesRef = db.collection('users').doc(req.uid).collection('aiMessages');
+
     // 2. Save user message
-    await pool.query(
-      'INSERT INTO messages (sender_id, content, is_ai) VALUES (?, ?, 0)',
-      [req.userId, message]
-    );
+    await aiMessagesRef.add({ content: message, isAi: false, createdAt: FieldValue.serverTimestamp() });
 
     // 3. Load personalisation context
-    const context = await loadUserContext(pool, req.userId);
+    const context = await loadUserContext(db, req.uid);
 
     // 4. Fetch recent history
-    const [historyRows] = await pool.query(
-      `SELECT content, is_ai FROM messages
-       WHERE sender_id = ? AND group_id IS NULL
-       ORDER BY created_at DESC LIMIT 20`,
-      [req.userId]
-    );
-    const history = historyRows.reverse().map(m => ({
-      role:    m.is_ai ? 'assistant' : 'user',
-      content: m.content,
-    }));
+    const historySnap = await aiMessagesRef.orderBy('createdAt', 'desc').limit(20).get();
+    const historyDocs = historySnap.docs.map(d => d.data()).reverse();
+    const history = historyDocs.map(m => ({ role: m.isAi ? 'assistant' : 'user', content: m.content }));
 
     // 5. Build prompt & call Gemini
     const systemPrompt = buildSystemPrompt(context);
@@ -93,18 +91,13 @@ router.post('/ai', auth, async (req, res) => {
     }
 
     // 6. Save AI reply
-    const [result] = await pool.query(
-      'INSERT INTO messages (sender_id, receiver_id, content, is_ai) VALUES (?, ?, ?, 1)',
-      [req.userId, req.userId, reply]
-    );
+    const replyRef = await aiMessagesRef.add({ content: reply, isAi: true, createdAt: FieldValue.serverTimestamp() });
 
     // 7. ─── MOOD SHIFT DETECTION ─────────────────────────
     let shiftNotification = null;
 
-    // Always trigger detection immediately on crisis language
-    // Otherwise, check periodically (every 4 user turns after 6 baseline turns)
     const historyForDetection = [
-      ...historyRows.reverse().map(m => ({ content: m.content, is_ai: m.is_ai })),
+      ...historyDocs.map(m => ({ content: m.content, is_ai: m.isAi })),
       { content: message, is_ai: false },
       { content: reply,   is_ai: true },
     ];
@@ -117,14 +110,14 @@ router.post('/ai', auth, async (req, res) => {
         : await detectMoodShift(historyForDetection);
 
       if (shift) {
-        console.log(`[MOOD SHIFT] user=${req.userId}, severity=${shift.severity}, ${shift.from_mood}→${shift.to_mood}`);
-        shiftNotification = await createShiftNotifications(pool, req.userId, shift, isCrisis);
+        console.log(`[MOOD SHIFT] user=${req.uid}, severity=${shift.severity}, ${shift.from_mood}→${shift.to_mood}`);
+        shiftNotification = await createShiftNotifications(db, req.uid, shift, isCrisis);
       }
     }
 
     res.json({
       reply,
-      message_id: result.insertId,
+      message_id: replyRef.id,
       is_crisis:  isCrisis,
       shift_notification: shiftNotification,   // frontend can show this inline
     });
@@ -139,15 +132,19 @@ router.post('/ai', auth, async (req, res) => {
 // GET /api/chat/ai/history
 router.get('/ai/history', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT m.*, u.username AS sender
-       FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       WHERE m.sender_id = ? AND m.group_id IS NULL
-       ORDER BY m.created_at ASC LIMIT 50`,
-      [req.userId]
-    );
-    res.json(rows);
+    const snap = await db.collection('users').doc(req.uid).collection('aiMessages')
+      .orderBy('createdAt', 'asc').limit(50).get();
+    const messages = snap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        sender_id: req.uid,
+        content: d.content,
+        is_ai: d.isAi,
+        created_at: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : d.createdAt,
+      };
+    });
+    res.json(messages);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -156,47 +153,47 @@ router.get('/ai/history', auth, async (req, res) => {
 
 // GET /api/chat/direct/:otherId
 router.get('/direct/:otherId', auth, async (req, res) => {
-  const otherId = parseInt(req.params.otherId);
+  const otherId = req.params.otherId;
   try {
-    const [rows] = await pool.query(
-      `SELECT m.*, u.username AS sender FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       WHERE ((m.sender_id = ? AND m.receiver_id = ?)
-           OR (m.sender_id = ? AND m.receiver_id = ?))
-         AND m.group_id IS NULL AND m.is_ai = 0
-       ORDER BY m.created_at ASC`,
-      [req.userId, otherId, otherId, req.userId]
-    );
-    res.json(rows);
+    const snap = await db.collection('dms').doc(dmId(req.uid, otherId)).collection('messages')
+      .orderBy('createdAt', 'asc').get();
+    const messages = snap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        sender_id: d.senderId,
+        sender: d.senderUsername,
+        receiver_id: d.receiverId,
+        content: d.content,
+        created_at: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : d.createdAt,
+      };
+    });
+    res.json(messages);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-//-welcome message
-router.post('/welcome', auth, async (req, res) => {
+// POST /api/chat/ai/welcome
+router.post('/ai/welcome', auth, async (req, res) => {
   try {
+    const aiMessagesRef = db.collection('users').doc(req.uid).collection('aiMessages');
+
     // If the user already has AI chat history, do NOT send a welcome.
     // This ensures the welcome only appears the very first time.
-    const [existing] = await pool.query(
-      `SELECT id FROM messages
-       WHERE sender_id = ? AND group_id IS NULL AND is_ai = 1
-       LIMIT 1`,
-      [req.userId]
-    );
- 
-    if (existing.length > 0) {
+    const existingSnap = await aiMessagesRef.where('isAi', '==', true).limit(1).get();
+    if (!existingSnap.empty) {
       return res.json({ welcome: null, already_welcomed: true });
     }
- 
+
     // Load context so we can personalise (name + AI name if you have that)
-    const context = await loadUserContext(pool, req.userId);
+    const context = await loadUserContext(db, req.uid);
     const aiName   = context.aiName   || 'Mira';
     const userName = context.userName || 'there';
- 
+
     // Build a short, warm welcome prompt
     const welcomeSystemPrompt = `You are ${aiName}, a warm and compassionate AI companion on Knoomi — a mental health platform for young adults in Malaysia and Southeast Asia.
- 
+
 This is the very first time you are meeting ${userName}. Write a warm, brief opening message (2–3 sentences max) that:
 - Introduces yourself by name gently ("Hi ${userName}, I'm ${aiName}...")
 - Makes it clear this is a safe space
@@ -204,9 +201,9 @@ This is the very first time you are meeting ${userName}. Write a warm, brief ope
 - Feels human, warm, and non-clinical
 - Does NOT ask multiple questions
 - Does NOT say "As an AI" or sound scripted
- 
+
 Output ONLY the welcome message text. No quotes. No preamble.`;
- 
+
     const response = await ai.models.generateContent({
       model: MODEL,
       contents: [{ role: 'user', parts: [{ text: 'Write the welcome message now.' }] }],
@@ -216,22 +213,19 @@ Output ONLY the welcome message text. No quotes. No preamble.`;
         maxOutputTokens: 200,
       },
     });
- 
+
     const welcome = response.text?.trim()
       || `Hi ${userName}, I'm ${aiName}. This is a safe space — whenever you're ready, I'm here to listen. 🌿`;
- 
+
     // Save the welcome as a real AI message so it appears in history
-    const [result] = await pool.query(
-      'INSERT INTO messages (sender_id, receiver_id, content, is_ai) VALUES (?, ?, ?, 1)',
-      [req.userId, req.userId, welcome]
-    );
- 
+    const result = await aiMessagesRef.add({ content: welcome, isAi: true, createdAt: FieldValue.serverTimestamp() });
+
     res.json({
       welcome,
-      message_id: result.insertId,
+      message_id: result.id,
       already_welcomed: false,
     });
- 
+
   } catch (err) {
     console.error('Welcome message error:', err);
     res.status(500).json({ error: err.message });

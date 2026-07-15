@@ -1,8 +1,18 @@
 const express = require('express');
-const pool    = require('../config/db');
+const { db, admin } = require('../config/firebase');
 const auth    = require('../middleware/auth');
 
 const router = express.Router();
+
+function serializeEntry(doc) {
+  const d = doc.data();
+  return {
+    id: doc.id,
+    score: d.score,
+    note: d.note || '',
+    logged_at: d.loggedAt?.toDate ? d.loggedAt.toDate().toISOString() : d.loggedAt,
+  };
+}
 
 // POST /api/mood
 router.post('/', auth, async (req, res) => {
@@ -10,12 +20,11 @@ router.post('/', auth, async (req, res) => {
   if (!score || score < 1 || score > 10)
     return res.status(400).json({ error: 'Score must be between 1 and 10' });
   try {
-    const [result] = await pool.query(
-      'INSERT INTO mood_entries (user_id, score, note) VALUES (?, ?, ?)',
-      [req.userId, score, note]
-    );
-    const [entry] = await pool.query('SELECT * FROM mood_entries WHERE id = ?', [result.insertId]);
-    res.status(201).json(entry[0]);
+    const ref = await db.collection('users').doc(req.uid).collection('moodEntries').add({
+      score, note, loggedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    const doc = await ref.get();
+    res.status(201).json(serializeEntry(doc));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -24,11 +33,9 @@ router.post('/', auth, async (req, res) => {
 // GET /api/mood — last 30 entries
 router.get('/', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT * FROM mood_entries WHERE user_id = ? ORDER BY logged_at ASC LIMIT 30',
-      [req.userId]
-    );
-    res.json(rows);
+    const snap = await db.collection('users').doc(req.uid).collection('moodEntries')
+      .orderBy('loggedAt', 'asc').limit(30).get();
+    res.json(snap.docs.map(serializeEntry));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -37,11 +44,9 @@ router.get('/', auth, async (req, res) => {
 // GET /api/mood/latest
 router.get('/latest', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT * FROM mood_entries WHERE user_id = ? ORDER BY logged_at DESC LIMIT 1',
-      [req.userId]
-    );
-    res.json(rows[0] || null);
+    const snap = await db.collection('users').doc(req.uid).collection('moodEntries')
+      .orderBy('loggedAt', 'desc').limit(1).get();
+    res.json(snap.empty ? null : serializeEntry(snap.docs[0]));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

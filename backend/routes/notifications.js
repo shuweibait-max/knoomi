@@ -4,23 +4,42 @@
 // ============================================================
 
 const express = require('express');
-const pool    = require('../config/db');
+const { db, admin } = require('../config/firebase');
 const auth    = require('../middleware/auth');
 
 const router = express.Router();
+
+function serialize(doc) {
+  const d = doc.data();
+  return {
+    id: doc.id,
+    user_id: d.userId,
+    type: d.type,
+    severity: d.severity,
+    title: d.title,
+    message: d.message,
+    metadata: d.metadata || {},
+    is_read: !!d.isRead,
+    created_at: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : d.createdAt,
+  };
+}
 
 // ─── User: fetch their own notifications ───────────────────
 // GET /api/notifications
 router.get('/', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT id, type, severity, title, message, metadata, is_read, created_at
-       FROM notifications
-       WHERE user_id = ? AND audience = 'user'
-       ORDER BY created_at DESC LIMIT 30`,
-      [req.userId]
-    );
-    res.json(rows);
+    // No orderBy here: two equality filters plus an orderBy on a third
+    // field need a composite index we can't provision in this environment
+    // — fetch matches (bounded by this user's own notification volume)
+    // and sort/slice in memory instead.
+    const snap = await db.collection('notifications')
+      .where('userId', '==', req.uid).where('audience', '==', 'user').get();
+    const sorted = [...snap.docs].sort((a, b) => {
+      const aTime = a.data().createdAt?.toMillis?.() || 0;
+      const bTime = b.data().createdAt?.toMillis?.() || 0;
+      return bTime - aTime;
+    }).slice(0, 30);
+    res.json(sorted.map(serialize));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -30,12 +49,10 @@ router.get('/', auth, async (req, res) => {
 // GET /api/notifications/unread-count
 router.get('/unread-count', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT COUNT(*) AS count FROM notifications
-       WHERE user_id = ? AND audience = 'user' AND is_read = 0`,
-      [req.userId]
-    );
-    res.json({ count: parseInt(rows[0].count) });
+    const countSnap = await db.collection('notifications')
+      .where('userId', '==', req.uid).where('audience', '==', 'user').where('isRead', '==', false)
+      .count().get();
+    res.json({ count: countSnap.data().count });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -45,11 +62,11 @@ router.get('/unread-count', auth, async (req, res) => {
 // PATCH /api/notifications/:id/read
 router.patch('/:id/read', auth, async (req, res) => {
   try {
-    await pool.query(
-      `UPDATE notifications SET is_read = 1
-       WHERE id = ? AND user_id = ? AND audience = 'user'`,
-      [parseInt(req.params.id), req.userId]
-    );
+    const ref = db.collection('notifications').doc(req.params.id);
+    const doc = await ref.get();
+    if (doc.exists && doc.data().userId === req.uid && doc.data().audience === 'user') {
+      await ref.update({ isRead: true });
+    }
     res.json({ message: 'Marked as read' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -60,11 +77,11 @@ router.patch('/:id/read', auth, async (req, res) => {
 // PATCH /api/notifications/read-all
 router.patch('/read-all', auth, async (req, res) => {
   try {
-    await pool.query(
-      `UPDATE notifications SET is_read = 1
-       WHERE user_id = ? AND audience = 'user'`,
-      [req.userId]
-    );
+    const snap = await db.collection('notifications')
+      .where('userId', '==', req.uid).where('audience', '==', 'user').get();
+    const batch = db.batch();
+    snap.docs.forEach(doc => batch.update(doc.ref, { isRead: true }));
+    await batch.commit();
     res.json({ message: 'All marked as read' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -79,15 +96,22 @@ router.get('/admin', auth, async (req, res) => {
     return res.status(403).json({ error: 'Admin access required' });
 
   try {
-    const [rows] = await pool.query(
-      `SELECT n.id, n.user_id, u.username, u.email,
-              n.type, n.severity, n.title, n.message, n.metadata,
-              n.is_read, n.created_at
-       FROM notifications n
-       JOIN users u ON u.id = n.user_id
-       WHERE n.audience = 'admin'
-       ORDER BY n.created_at DESC LIMIT 100`
-    );
+    const rawSnap = await db.collection('notifications').where('audience', '==', 'admin').get();
+    const snap = { docs: [...rawSnap.docs].sort((a, b) => {
+      const aTime = a.data().createdAt?.toMillis?.() || 0;
+      const bTime = b.data().createdAt?.toMillis?.() || 0;
+      return bTime - aTime;
+    }).slice(0, 100) };
+
+    const uids = [...new Set(snap.docs.map(d => d.data().userId))];
+    const userDocs = await Promise.all(uids.map(uid => db.collection('users').doc(uid).get()));
+    const usersByUid = Object.fromEntries(userDocs.map(d => [d.id, d.data()]));
+
+    const rows = snap.docs.map(doc => ({
+      ...serialize(doc),
+      username: usersByUid[doc.data().userId]?.username || null,
+      email: usersByUid[doc.data().userId]?.email || null,
+    }));
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -101,11 +125,11 @@ router.patch('/admin/:id/read', auth, async (req, res) => {
     return res.status(403).json({ error: 'Admin access required' });
 
   try {
-    await pool.query(
-      `UPDATE notifications SET is_read = 1
-       WHERE id = ? AND audience = 'admin'`,
-      [parseInt(req.params.id)]
-    );
+    const ref = db.collection('notifications').doc(req.params.id);
+    const doc = await ref.get();
+    if (doc.exists && doc.data().audience === 'admin') {
+      await ref.update({ isRead: true });
+    }
     res.json({ message: 'Marked as reviewed' });
   } catch (err) {
     res.status(500).json({ error: err.message });

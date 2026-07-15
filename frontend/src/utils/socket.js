@@ -3,6 +3,7 @@
 // ============================================================
 
 import { io } from 'socket.io-client'
+import { auth } from '../config/firebase'
 
 // In dev: connect to the same origin (Vite proxies socket.io to backend)
 // In prod: connect directly to the Render backend URL
@@ -23,8 +24,8 @@ export function connectSocket() {
   const s = getSocket()
   if (!s.connected) {
     s.connect()
-    s.on('connect', () => {
-      const token = localStorage.getItem('mb_token')
+    s.on('connect', async () => {
+      const token = await auth.currentUser?.getIdToken()
       if (token) s.emit('connect_user', { token })
     })
   }

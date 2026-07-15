@@ -157,22 +157,19 @@ async function summariseHistory(history, ai) {
 }
 
 // ─── USER CONTEXT LOADER (now includes ai_name) ─────────────
-async function loadUserContext(pool, userId) {
-  const [userRows] = await pool.query(
-    'SELECT username, ai_name FROM users WHERE id = ?',
-    [userId]
-  );
-  const userName = userRows[0]?.username ?? 'there';
-  const aiName   = userRows[0]?.ai_name  ?? 'Mira';
+// Video-session and AI-message-count checks each use single-field equality
+// queries (filtered/counted in two calls or in memory) rather than compound
+// where() chains, since Firestore composite indexes for those would need to
+// be provisioned out-of-band and aren't available in this environment.
+async function loadUserContext(db, uid) {
+  const userDoc  = await db.collection('users').doc(uid).get();
+  const userName = userDoc.data()?.username ?? 'there';
+  const aiName   = userDoc.data()?.ai_name  ?? 'Mira';
 
-  const [moodRows] = await pool.query(
-    `SELECT score FROM mood_entries
-     WHERE user_id = ?
-     ORDER BY logged_at DESC LIMIT 7`,
-    [userId]
-  );
+  const moodSnap = await db.collection('users').doc(uid).collection('moodEntries')
+    .orderBy('loggedAt', 'desc').limit(7).get();
+  const moodScores = moodSnap.docs.map(d => d.data().score);
 
-  const moodScores = moodRows.map(r => r.score);
   const recentMoodAvg = moodScores.length
     ? Math.round((moodScores.reduce((a, b) => a + b, 0) / moodScores.length) * 10) / 10
     : null;
@@ -185,20 +182,16 @@ async function loadUserContext(pool, userId) {
     : newestScore < oldestScore - 1 ? "declining"
     : "stable";
 
-  const [therapistRows] = await pool.query(
-    `SELECT id FROM video_sessions
-     WHERE (host_id = ? OR participant_id = ?)
-       AND ended_at IS NULL LIMIT 1`,
-    [userId, userId]
-  );
-  const hasTherapist = therapistRows.length > 0;
+  const [hostSnap, participantSnap] = await Promise.all([
+    db.collection('videoSessions').where('hostId', '==', uid).get(),
+    db.collection('videoSessions').where('participantId', '==', uid).get(),
+  ]);
+  const isActive = doc => !doc.data().endedAt;
+  const hasTherapist = hostSnap.docs.some(isActive) || participantSnap.docs.some(isActive);
 
-  const [sessionRows] = await pool.query(
-    `SELECT COUNT(*) AS count FROM messages
-     WHERE sender_id = ? AND group_id IS NULL AND is_ai = 1`,
-    [userId]
-  );
-  const sessionCount = parseInt(sessionRows[0]?.count ?? 0);
+  const sessionCountSnap = await db.collection('users').doc(uid).collection('aiMessages')
+    .where('isAi', '==', true).count().get();
+  const sessionCount = sessionCountSnap.data().count;
 
   return { userName, aiName, recentMoodAvg, recentMoodTrend, hasTherapist, sessionCount };
 }

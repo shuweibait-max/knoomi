@@ -1,84 +1,58 @@
 const express = require('express');
-const bcrypt  = require('bcryptjs');
-const jwt     = require('jsonwebtoken');
-const pool    = require('../config/db');
+const { db, auth: firebaseAuth } = require('../config/firebase');
 const auth    = require('../middleware/auth');
 
 const router = express.Router();
 
-// POST /api/auth/register
-router.post('/register', async (req, res) => {
-  const { username, email, password, role = 'user' } = req.body;
+const USER_FIELDS = ['username', 'email', 'role', 'ai_name', 'ai_avatar', 'created_at'];
 
-  if (!username || !email || !password)
-    return res.status(400).json({ error: 'All fields are required' });
-  if (password.length < 8)
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+function serializeUser(uid, data) {
+  const out = { id: uid };
+  for (const key of USER_FIELDS) out[key] = data[key] ?? null;
+  return out;
+}
 
-  try {
-    const [existing] = await pool.query(
-      'SELECT id FROM users WHERE email = ? OR username = ?', [email.toLowerCase(), username]
-    );
-    if (existing.length > 0)
-      return res.status(409).json({ error: 'Email or username already taken' });
+// POST /api/auth/profile-init
+// Called by the client right after Firebase Auth account creation to set up
+// the corresponding Firestore user profile (Firebase Auth alone has no
+// concept of username/role/ai_name).
+router.post('/profile-init', auth, async (req, res) => {
+  const { username, role = 'user' } = req.body;
 
-    const hash = await bcrypt.hash(password, 12);
-    const [result] = await pool.query(
-      'INSERT INTO users (username, email, password_hash, role) VALUES (?, ?, ?, ?)',
-      [username, email.toLowerCase(), hash, role]
-    );
+  if (!username || username.length < 3)
+    return res.status(400).json({ error: 'Username must be at least 3 characters' });
 
-    const token = jwt.sign(
-      { userId: result.insertId, role },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    // Fetch the full user record (includes ai_name default 'Mira' and created_at)
-    const [newUserRows] = await pool.query(
-      'SELECT id, username, email, role, ai_name, ai_avatar, created_at FROM users WHERE id = ?',
-      [result.insertId]
-    );
-
-    res.status(201).json({ token, user: newUserRows[0] });
-  } catch (err) {
-    console.error('Register error:', err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// POST /api/auth/login
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ error: 'Email and password required' });
+  const usernameLower = username.toLowerCase();
+  const userRef     = db.collection('users').doc(req.uid);
+  const usernameRef = db.collection('usernames').doc(usernameLower);
 
   try {
-    const [rows] = await pool.query('SELECT * FROM users WHERE email = ?', [email.toLowerCase()]);
-    const user = rows[0];
-    if (!user || !(await bcrypt.compare(password, user.password_hash)))
-      return res.status(401).json({ error: 'Invalid email or password' });
+    await db.runTransaction(async (tx) => {
+      const existingUser = await tx.get(userRef);
+      if (existingUser.exists) throw Object.assign(new Error('Profile already exists'), { code: 409 });
 
-    const token = jwt.sign(
-      { userId: user.id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
+      const usernameDoc = await tx.get(usernameRef);
+      if (usernameDoc.exists) throw Object.assign(new Error('Username already taken'), { code: 409 });
 
-    res.json({
-      token,
-      user: {
-        id: user.id,
-        username: user.username,
-        email: user.email,
-        role: user.role,
-        ai_name: user.ai_name,
-        ai_avatar: user.ai_avatar,
-        created_at: user.created_at,
-      }
+      const email = req.firebaseUser?.email || null;
+      const createdAt = new Date().toISOString();
+
+      tx.set(userRef, {
+        username,
+        email,
+        role,
+        ai_name: 'Mira',
+        ai_avatar: null,
+        created_at: createdAt,
+      });
+      tx.set(usernameRef, { uid: req.uid });
     });
+
+    const newUserDoc = await userRef.get();
+    res.status(201).json({ user: serializeUser(req.uid, newUserDoc.data()) });
   } catch (err) {
-    console.error('Login error:', err);
+    if (err.code === 409) return res.status(409).json({ error: err.message });
+    console.error('Profile init error:', err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -86,12 +60,9 @@ router.post('/login', async (req, res) => {
 // GET /api/auth/me
 router.get('/me', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      'SELECT id, username, email, role, ai_name, ai_avatar, created_at FROM users WHERE id = ?',
-      [req.userId]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    res.json(rows[0]);
+    const doc = await db.collection('users').doc(req.uid).get();
+    if (!doc.exists) return res.status(404).json({ error: 'User not found' });
+    res.json(serializeUser(req.uid, doc.data()));
   } catch (err) {
     console.error('Me error:', err);
     res.status(500).json({ error: err.message });
@@ -109,40 +80,34 @@ router.put('/profile', auth, async (req, res) => {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return res.status(400).json({ error: 'Invalid email format' });
 
+  const normalizedEmail = email.toLowerCase();
+  const usernameLower   = username.toLowerCase();
+  const userRef         = db.collection('users').doc(req.uid);
+  const newUsernameRef  = db.collection('usernames').doc(usernameLower);
+
   try {
-    const normalizedEmail = email.toLowerCase();
+    const currentDoc = await userRef.get();
+    if (!currentDoc.exists) return res.status(404).json({ error: 'User not found' });
+    const oldUsernameLower = (currentDoc.data().username || '').toLowerCase();
 
-    // Check if username is taken by someone else
-    const [takenByUsername] = await pool.query(
-      'SELECT id FROM users WHERE username = ? AND id != ?',
-      [username, req.userId]
-    );
-    if (takenByUsername.length > 0)
-      return res.status(409).json({ error: 'Username already taken' });
+    if (usernameLower !== oldUsernameLower) {
+      await db.runTransaction(async (tx) => {
+        const takenDoc = await tx.get(newUsernameRef);
+        if (takenDoc.exists) throw Object.assign(new Error('Username already taken'), { code: 409 });
+        tx.delete(db.collection('usernames').doc(oldUsernameLower));
+        tx.set(newUsernameRef, { uid: req.uid });
+        tx.update(userRef, { username, email: normalizedEmail });
+      });
+    } else {
+      await userRef.update({ username, email: normalizedEmail });
+    }
 
-    // Check if email is taken by someone else
-    const [takenByEmail] = await pool.query(
-      'SELECT id FROM users WHERE email = ? AND id != ?',
-      [normalizedEmail, req.userId]
-    );
-    if (takenByEmail.length > 0)
-      return res.status(409).json({ error: 'Email already taken' });
+    await firebaseAuth.updateUser(req.uid, { email: normalizedEmail });
 
-    // Perform the update
-    await pool.query(
-      'UPDATE users SET username = ?, email = ? WHERE id = ?',
-      [username, normalizedEmail, req.userId]
-    );
-
-    // Fetch the updated record
-    const [updatedRows] = await pool.query(
-      'SELECT id, username, email, role, ai_name, ai_avatar, created_at FROM users WHERE id = ?',
-      [req.userId]
-    );
-
-    if (!updatedRows[0]) return res.status(404).json({ error: 'User not found' });
-    res.json(updatedRows[0]);
+    const updatedDoc = await userRef.get();
+    res.json(serializeUser(req.uid, updatedDoc.data()));
   } catch (err) {
+    if (err.code === 409) return res.status(409).json({ error: err.message });
     console.error('Profile update error:', err);
     res.status(500).json({ error: err.message });
   }
@@ -152,66 +117,39 @@ router.put('/profile', auth, async (req, res) => {
 router.put('/ai-name', auth, async (req, res) => {
   const { ai_name, ai_avatar } = req.body;
   const trimmedName = (ai_name || '').trim();
- 
-  // Name validation
+
   if (!trimmedName)
     return res.status(400).json({ error: 'AI name cannot be empty' });
   if (trimmedName.length > 50)
     return res.status(400).json({ error: 'AI name must be 50 characters or less' });
   if (!/^[a-zA-Z0-9\s\-']+$/.test(trimmedName))
     return res.status(400).json({ error: 'AI name can only contain letters, numbers, spaces, hyphens and apostrophes' });
- 
-  // Avatar validation (optional — if not sent, keep existing)
+
   const trimmedAvatar = ai_avatar ? String(ai_avatar).trim() : null;
   if (trimmedAvatar && trimmedAvatar.length > 10)
     return res.status(400).json({ error: 'Invalid avatar' });
- 
+
   try {
-    if (trimmedAvatar) {
-      await pool.query(
-        'UPDATE users SET ai_name = ?, ai_avatar = ? WHERE id = ?',
-        [trimmedName, trimmedAvatar, req.userId]
-      );
-    } else {
-      await pool.query(
-        'UPDATE users SET ai_name = ? WHERE id = ?',
-        [trimmedName, req.userId]
-      );
-    }
- 
-    const [updatedRows] = await pool.query(
-      'SELECT id, username, email, role, ai_name, ai_avatar, created_at FROM users WHERE id = ?',
-      [req.userId]
-    );
-    res.json(updatedRows[0]);
+    const userRef = db.collection('users').doc(req.uid);
+    const update = { ai_name: trimmedName };
+    if (trimmedAvatar) update.ai_avatar = trimmedAvatar;
+
+    await userRef.update(update);
+
+    const updatedDoc = await userRef.get();
+    res.json(serializeUser(req.uid, updatedDoc.data()));
   } catch (err) {
     console.error('AI customization update error:', err);
     res.status(500).json({ error: err.message });
   }
 });
- 
+
 // PUT /api/auth/password
+// Password is managed entirely by Firebase Auth now — the client SDK's
+// updatePassword()/sendPasswordResetEmail() replace this endpoint.
+// Kept as a 410 so any stale frontend calls fail loudly instead of silently.
 router.put('/password', auth, async (req, res) => {
-  const { currentPassword, newPassword } = req.body;
-  if (!currentPassword || !newPassword)
-    return res.status(400).json({ error: 'Both passwords are required' });
-  if (newPassword.length < 8)
-    return res.status(400).json({ error: 'New password must be at least 8 characters' });
-
-  try {
-    const [rows] = await pool.query('SELECT password_hash FROM users WHERE id = ?', [req.userId]);
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-
-    const valid = await bcrypt.compare(currentPassword, rows[0].password_hash);
-    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
-
-    const hash = await bcrypt.hash(newPassword, 12);
-    await pool.query('UPDATE users SET password_hash = ? WHERE id = ?', [hash, req.userId]);
-    res.json({ message: 'Password updated successfully' });
-  } catch (err) {
-    console.error('Password update error:', err);
-    res.status(500).json({ error: err.message });
-  }
+  res.status(410).json({ error: 'Password changes are handled by Firebase Auth on the client now' });
 });
 
 module.exports = router;

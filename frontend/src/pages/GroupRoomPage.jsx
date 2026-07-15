@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
+import { collection, query, orderBy, limit, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore'
+import { db, auth } from '../config/firebase'
 import api from '../utils/api'
 import { connectSocket, getSocket } from '../utils/socket'
 import { useAuth } from '../context/AuthContext'
@@ -7,7 +9,7 @@ import GroupManageModal from '../components/groups/GroupManageModal'
 
 export default function GroupRoomPage() {
   const { id }   = useParams()
-  const groupId  = parseInt(id)
+  const groupId  = id
   const { user } = useAuth()
   const navigate = useNavigate()
   const [messages,  setMessages]  = useState([])
@@ -20,25 +22,37 @@ export default function GroupRoomPage() {
 
   const loadGroupInfo = () => {
     api.get('/groups/mine')
-      .then(r => setGroupInfo(r.data.find(g => g.id === groupId)))
-      .catch(() => {})
+      .then(r => {
+        const info = r.data.find(g => g.id === groupId)
+        if (!info) { navigate('/groups'); return }
+        setGroupInfo(info)
+      })
+      .catch(() => navigate('/groups'))
   }
 
+  useEffect(() => { loadGroupInfo() }, [groupId])
+
+  // Messages come straight from Firestore — no Express round-trip, no
+  // socket relay. Firestore security rules enforce group membership.
   useEffect(() => {
-    Promise.all([
-      api.get(`/groups/${groupId}/messages`),
-      api.get('/groups/mine'),
-    ]).then(([msgRes, groupRes]) => {
-      setMessages(msgRes.data)
-      setGroupInfo(groupRes.data.find(g => g.id === groupId))
-    }).catch(() => navigate('/groups'))
+    const q = query(
+      collection(db, 'groups', groupId, 'messages'),
+      orderBy('createdAt', 'asc'),
+      limit(200)
+    )
+    const unsubscribe = onSnapshot(q, snap => {
+      setMessages(snap.docs.map(doc => {
+        const d = doc.data()
+        return { id: doc.id, sender_id: d.senderId, sender: d.senderUsername, content: d.content }
+      }))
+    }, () => {
+      // Most likely cause: Firestore security rules not yet published,
+      // or the user isn't (or is no longer) a member of this group.
+      navigate('/groups')
+    })
 
     const socket = connectSocket()
-    const token  = localStorage.getItem('mb_token')
-    socket.emit('join_group_room', { token, group_id: groupId })
-
-    socket.on('new_group_message', msg => setMessages(m => [...m, msg]))
-    socket.on('system_message',    msg => setMessages(m => [...m, { ...msg, is_system: true, id: Date.now() }]))
+    socket.emit('join_group_room', { group_id: groupId })
     socket.on('user_typing', ({ username }) => {
       setTyping(`${username} is typing…`)
       clearTimeout(typingTimer.current)
@@ -46,9 +60,8 @@ export default function GroupRoomPage() {
     })
 
     return () => {
-      socket.emit('leave_group_room', { token, group_id: groupId })
-      socket.off('new_group_message')
-      socket.off('system_message')
+      unsubscribe()
+      socket.emit('leave_group_room', { group_id: groupId })
       socket.off('user_typing')
     }
   }, [groupId])
@@ -57,25 +70,35 @@ export default function GroupRoomPage() {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const sendMessage = () => {
+  const sendMessage = async () => {
     const content = input.trim()
     if (!content) return
-    const token = localStorage.getItem('mb_token')
-    getSocket()?.emit('send_group_message', { token, group_id: groupId, content })
     setInput('')
+    try {
+      await addDoc(collection(db, 'groups', groupId, 'messages'), {
+        senderId: user.id,
+        senderUsername: user.username,
+        content,
+        createdAt: serverTimestamp(),
+      })
+    } catch {
+      alert('Could not send message — check your connection and try again.')
+    }
+  }
+
+  const emitTyping = async () => {
+    const token = await auth.currentUser?.getIdToken()
+    getSocket()?.emit('typing', { token, group_id: groupId })
   }
 
   const handleKeyDown = e => {
     if (e.key === 'Enter') { e.preventDefault(); sendMessage() }
-    const token = localStorage.getItem('mb_token')
-    getSocket()?.emit('typing', { token, group_id: groupId })
+    emitTyping()
   }
 
   const leaveGroup = async () => {
     if (!confirm('Leave this group?')) return
     try {
-      const token = localStorage.getItem('mb_token')
-      getSocket()?.emit('leave_group_room', { token, group_id: groupId })
       await api.delete(`/groups/${groupId}/leave`)
       navigate('/groups')
     } catch (err) {
@@ -115,26 +138,22 @@ export default function GroupRoomPage() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
         {messages.map((msg, i) => (
-          msg.is_system ? (
-            <div key={msg.id || i} className="text-center text-xs text-slate-400 py-1 italic">{msg.content}</div>
-          ) : (
-            <div key={msg.id || i} className={`flex gap-2 ${msg.sender_id === user?.id ? 'flex-row-reverse' : ''}`}>
-              <div className="w-7 h-7 rounded-full bg-slate-200 text-slate-600 flex items-center justify-center text-xs font-bold shrink-0 self-end">
-                {msg.sender?.[0]?.toUpperCase()}
-              </div>
-              <div className={`max-w-[65%] flex flex-col ${msg.sender_id === user?.id ? 'items-end' : 'items-start'}`}>
-                {msg.sender_id !== user?.id && (
-                  <span className="text-xs text-slate-400 mb-1 px-1">{msg.sender}</span>
-                )}
-                <div className={`px-3 py-2 rounded-xl text-sm leading-relaxed
-                  ${msg.sender_id === user?.id
-                    ? 'bg-brand-600 text-white rounded-tr-sm'
-                    : 'bg-white border border-slate-200 text-slate-700 rounded-tl-sm'}`}>
-                  {msg.content}
-                </div>
+          <div key={msg.id || i} className={`flex gap-2 ${msg.sender_id === user?.id ? 'flex-row-reverse' : ''}`}>
+            <div className="w-7 h-7 rounded-full bg-slate-200 text-slate-600 flex items-center justify-center text-xs font-bold shrink-0 self-end">
+              {msg.sender?.[0]?.toUpperCase()}
+            </div>
+            <div className={`max-w-[65%] flex flex-col ${msg.sender_id === user?.id ? 'items-end' : 'items-start'}`}>
+              {msg.sender_id !== user?.id && (
+                <span className="text-xs text-slate-400 mb-1 px-1">{msg.sender}</span>
+              )}
+              <div className={`px-3 py-2 rounded-xl text-sm leading-relaxed
+                ${msg.sender_id === user?.id
+                  ? 'bg-brand-600 text-white rounded-tr-sm'
+                  : 'bg-white border border-slate-200 text-slate-700 rounded-tl-sm'}`}>
+                {msg.content}
               </div>
             </div>
-          )
+          </div>
         ))}
         {typing && <div className="text-xs text-slate-400 italic px-2">{typing}</div>}
         <div ref={bottomRef} />

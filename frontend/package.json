@@ -13,6 +13,7 @@
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.24.1",
     "axios": "^1.7.2",
+    "firebase": "^10.14.1",
     "socket.io-client": "^4.7.5",
     "recharts": "^2.12.7"
   },

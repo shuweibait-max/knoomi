@@ -1,21 +1,97 @@
 const express = require('express');
 const crypto  = require('crypto');
-const pool    = require('../config/db');
+const { db, admin } = require('../config/firebase');
 const auth    = require('../middleware/auth');
 
 const router = express.Router();
+const FieldValue = admin.firestore.FieldValue;
 
 function generateInviteCode() {
   return crypto.randomBytes(5).toString('hex');
 }
 
-// Fetch the current user's membership row for a group (or null)
-async function getMembership(groupId, userId) {
-  const [rows] = await pool.query(
-    'SELECT role FROM group_members WHERE group_id = ? AND user_id = ?',
-    [groupId, userId]
+function toISO(ts) {
+  return ts?.toDate ? ts.toDate().toISOString() : ts ?? null;
+}
+
+function serializeGroup(id, data, extra = {}) {
+  return {
+    id,
+    name: data.name,
+    description: data.description || '',
+    topic: data.topic,
+    created_by: data.createdBy,
+    is_private: !!data.isPrivate,
+    invite_code: data.inviteCode,
+    member_count: data.memberCount || 0,
+    created_at: toISO(data.createdAt),
+    ...extra,
+  };
+}
+
+// Fetch the current user's membership doc for a group (or null)
+async function getMembership(groupId, uid) {
+  const doc = await db.collection('groups').doc(groupId).collection('members').doc(uid).get();
+  return doc.exists ? doc.data() : null;
+}
+
+// Map<groupId, role> for every group the user belongs to — backed by a
+// denormalized users/{uid}.groupIds array rather than a Firestore
+// collection-group query, since collection-group queries need a manually
+// created index we can't provision from here.
+async function getMyGroupRoles(uid) {
+  const userDoc = await db.collection('users').doc(uid).get();
+  const groupIds = userDoc.data()?.groupIds || [];
+  if (groupIds.length === 0) return new Map();
+
+  const memberDocs = await Promise.all(
+    groupIds.map(gid => db.collection('groups').doc(gid).collection('members').doc(uid).get())
   );
-  return rows[0] || null;
+  const map = new Map();
+  memberDocs.forEach((doc, i) => { if (doc.exists) map.set(groupIds[i], doc.data().role); });
+  return map;
+}
+
+async function addMember(groupRef, uid, role) {
+  const userDoc = await db.collection('users').doc(uid).get();
+  await groupRef.collection('members').doc(uid).set({
+    uid,
+    role,
+    username: userDoc.data()?.username || null,
+    joinedAt: FieldValue.serverTimestamp(),
+  });
+  await groupRef.update({ memberCount: FieldValue.increment(1) });
+  await db.collection('users').doc(uid).update({ groupIds: FieldValue.arrayUnion(groupRef.id) });
+}
+
+async function removeMember(groupRef, uid) {
+  await groupRef.collection('members').doc(uid).delete();
+  await groupRef.update({ memberCount: FieldValue.increment(-1) });
+  await db.collection('users').doc(uid).update({ groupIds: FieldValue.arrayRemove(groupRef.id) });
+}
+
+// Generates a unique invite code, atomically swapping it in for an
+// already-existing group (used by regenerate + the missing-code fallback).
+async function regenerateInviteCode(groupRef) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const candidate = generateInviteCode();
+    const codeRef = db.collection('inviteCodes').doc(candidate);
+    try {
+      await db.runTransaction(async (tx) => {
+        const codeDoc = await tx.get(codeRef);
+        if (codeDoc.exists) throw Object.assign(new Error('taken'), { code: 'taken' });
+        const groupDoc = await tx.get(groupRef);
+        const oldCode = groupDoc.data()?.inviteCode;
+        tx.create(codeRef, { groupId: groupRef.id });
+        if (oldCode) tx.delete(db.collection('inviteCodes').doc(oldCode));
+        tx.update(groupRef, { inviteCode: candidate });
+      });
+      return candidate;
+    } catch (e) {
+      if (e.code !== 'taken') throw e;
+    }
+  }
+  throw new Error('Could not generate a unique invite code');
 }
 
 
@@ -23,22 +99,23 @@ async function getMembership(groupId, userId) {
 router.get('/', auth, async (req, res) => {
   const { topic } = req.query;
   try {
-    let query = `
-      SELECT g.*,
-             (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) AS member_count,
-             (SELECT gm2.role FROM group_members gm2 WHERE gm2.group_id = g.id AND gm2.user_id = ?) AS my_role
-      FROM "groups" g
-      WHERE g.is_private = 0`;
-    const params = [req.userId];
-    if (topic && topic !== 'All') {
-      query += ' AND g.topic = ?';
-      params.push(topic);
-    }
-    query += ' ORDER BY g.created_at DESC';
-    const [rows] = await pool.query(query, params);
+    // No orderBy here: an equality filter on topic plus an orderBy on a
+    // different field needs a composite index we can't provision in this
+    // environment — sort in memory instead (no limit() on this endpoint,
+    // so nothing to slice).
+    let query = db.collection('groups').where('isPrivate', '==', false);
+    if (topic && topic !== 'All') query = query.where('topic', '==', topic);
+    const snap = await query.get();
+    const sortedDocs = [...snap.docs].sort((a, b) =>
+      (b.data().createdAt?.toMillis?.() || 0) - (a.data().createdAt?.toMillis?.() || 0)
+    );
 
-    const withMembership = rows.map(g => ({ ...g, is_member: !!g.my_role }));
-    res.json(withMembership);
+    const myRoles = await getMyGroupRoles(req.uid);
+    const groups = sortedDocs.map(doc => {
+      const myRole = myRoles.get(doc.id) || null;
+      return { ...serializeGroup(doc.id, doc.data()), my_role: myRole, is_member: !!myRole };
+    });
+    res.json(groups);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -48,16 +125,17 @@ router.get('/', auth, async (req, res) => {
 // ─── GET /api/groups/mine ─── groups the current user belongs to ────────────
 router.get('/mine', auth, async (req, res) => {
   try {
-    const [rows] = await pool.query(
-      `SELECT g.*, gm.role AS my_role,
-              (SELECT COUNT(*) FROM group_members gm2 WHERE gm2.group_id = g.id) AS member_count
-       FROM "groups" g
-       JOIN group_members gm ON gm.group_id = g.id
-       WHERE gm.user_id = ?
-       ORDER BY g.created_at DESC`,
-      [req.userId]
+    const myRoles = await getMyGroupRoles(req.uid);
+    if (myRoles.size === 0) return res.json([]);
+
+    const groupDocs = await Promise.all(
+      [...myRoles.keys()].map(id => db.collection('groups').doc(id).get())
     );
-    res.json(rows.map(g => ({ ...g, is_member: true })));
+    const groups = groupDocs
+      .filter(d => d.exists)
+      .sort((a, b) => (b.data().createdAt?.toMillis?.() || 0) - (a.data().createdAt?.toMillis?.() || 0))
+      .map(d => ({ ...serializeGroup(d.id, d.data()), my_role: myRoles.get(d.id), is_member: true }));
+    res.json(groups);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -70,39 +148,49 @@ router.post('/', auth, async (req, res) => {
   if (!name || !name.trim())
     return res.status(400).json({ error: 'Group name is required' });
 
+  const trimmedName = name.trim();
+  const nameLower = trimmedName.toLowerCase();
+
   try {
-    const [existing] = await pool.query(
-      'SELECT id FROM "groups" WHERE LOWER(name) = LOWER(?)',
-      [name.trim()]
-    );
-    if (existing.length > 0)
+    const dupeSnap = await db.collection('groups').where('nameLower', '==', nameLower).limit(1).get();
+    if (!dupeSnap.empty)
       return res.status(409).json({ error: 'A group with this name already exists' });
 
-    let inviteCode = generateInviteCode();
-    for (let i = 0; i < 3; i++) {
-      const [check] = await pool.query('SELECT id FROM "groups" WHERE invite_code = ?', [inviteCode]);
-      if (check.length === 0) break;
-      inviteCode = generateInviteCode();
+    const groupRef = db.collection('groups').doc();
+
+    let inviteCode;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const candidate = generateInviteCode();
+      const codeRef = db.collection('inviteCodes').doc(candidate);
+      try {
+        await db.runTransaction(async (tx) => {
+          const codeDoc = await tx.get(codeRef);
+          if (codeDoc.exists) throw Object.assign(new Error('taken'), { code: 'taken' });
+          tx.create(codeRef, { groupId: groupRef.id });
+        });
+        inviteCode = candidate;
+        break;
+      } catch (e) {
+        if (e.code !== 'taken') throw e;
+      }
     }
+    if (!inviteCode) throw new Error('Could not generate a unique invite code');
 
-    const [result] = await pool.query(
-      'INSERT INTO "groups" (name, description, topic, created_by, is_private, invite_code) VALUES (?, ?, ?, ?, ?, ?)',
-      [name.trim(), description || '', topic || 'General', req.userId, is_private ? 1 : 0, inviteCode]
-    );
+    await groupRef.set({
+      name: trimmedName,
+      nameLower,
+      description: description || '',
+      topic: topic || 'General',
+      createdBy: req.uid,
+      isPrivate: !!is_private,
+      inviteCode,
+      memberCount: 0,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+    await addMember(groupRef, req.uid, 'owner');
 
-    await pool.query(
-      'INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)',
-      [result.insertId, req.userId, 'owner']
-    );
-
-    const [newGroup] = await pool.query(
-      `SELECT g.*, 'owner' AS my_role,
-              (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) AS member_count
-       FROM "groups" g WHERE g.id = ?`,
-      [result.insertId]
-    );
-
-    res.status(201).json({ ...newGroup[0], is_member: true });
+    const newDoc = await groupRef.get();
+    res.status(201).json({ ...serializeGroup(newDoc.id, newDoc.data()), my_role: 'owner', is_member: true });
   } catch (err) {
     console.error('Create group error:', err);
     res.status(500).json({ error: err.message });
@@ -112,21 +200,20 @@ router.post('/', auth, async (req, res) => {
 
 // ─── POST /api/groups/:id/join ─── join a PUBLIC group directly ────────────
 router.post('/:id/join', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const [groupRows] = await pool.query('SELECT id, name, is_private FROM "groups" WHERE id = ?', [groupId]);
-    if (!groupRows[0]) return res.status(404).json({ error: 'Group not found' });
-    if (groupRows[0].is_private === 1)
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    if (!groupDoc.exists) return res.status(404).json({ error: 'Group not found' });
+    const group = groupDoc.data();
+    if (group.isPrivate)
       return res.status(403).json({ error: 'This group is private — you need an invite link to join.' });
 
-    const existing = await getMembership(groupId, req.userId);
+    const existing = await getMembership(groupId, req.uid);
     if (existing) return res.status(409).json({ error: 'You are already a member of this group' });
 
-    await pool.query(
-      'INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)',
-      [groupId, req.userId, 'member']
-    );
-    res.json({ message: 'Joined group', group_id: groupId, group_name: groupRows[0].name });
+    await addMember(groupRef, req.uid, 'member');
+    res.json({ message: 'Joined group', group_id: groupId, group_name: group.name });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -137,18 +224,27 @@ router.post('/:id/join', auth, async (req, res) => {
 router.get('/invite/:code', auth, async (req, res) => {
   const code = String(req.params.code || '').toLowerCase();
   try {
-    const [rows] = await pool.query(
-      `SELECT g.id, g.name, g.description, g.topic, g.is_private,
-              u.username AS created_by_name,
-              (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) AS member_count,
-              (SELECT gm2.role FROM group_members gm2 WHERE gm2.group_id = g.id AND gm2.user_id = ?) AS my_role
-       FROM "groups" g
-       JOIN users u ON u.id = g.created_by
-       WHERE g.invite_code = ?`,
-      [req.userId, code]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Invalid or expired invite link' });
-    res.json({ ...rows[0], is_member: !!rows[0].my_role });
+    const codeDoc = await db.collection('inviteCodes').doc(code).get();
+    if (!codeDoc.exists) return res.status(404).json({ error: 'Invalid or expired invite link' });
+
+    const groupId = codeDoc.data().groupId;
+    const groupDoc = await db.collection('groups').doc(groupId).get();
+    if (!groupDoc.exists) return res.status(404).json({ error: 'Invalid or expired invite link' });
+    const group = groupDoc.data();
+
+    const creatorDoc = await db.collection('users').doc(group.createdBy).get();
+    const membership = await getMembership(groupId, req.uid);
+
+    res.json({
+      id: groupId,
+      name: group.name,
+      description: group.description,
+      topic: group.topic,
+      is_private: group.isPrivate,
+      created_by_name: creatorDoc.data()?.username || 'Unknown',
+      member_count: group.memberCount || 0,
+      is_member: !!membership,
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -159,18 +255,20 @@ router.get('/invite/:code', auth, async (req, res) => {
 router.post('/invite/:code/join', auth, async (req, res) => {
   const code = String(req.params.code || '').toLowerCase();
   try {
-    const [groupRows] = await pool.query('SELECT id, name FROM "groups" WHERE invite_code = ?', [code]);
-    if (!groupRows[0]) return res.status(404).json({ error: 'Invalid or expired invite link' });
+    const codeDoc = await db.collection('inviteCodes').doc(code).get();
+    if (!codeDoc.exists) return res.status(404).json({ error: 'Invalid or expired invite link' });
 
-    const groupId = groupRows[0].id;
-    const existing = await getMembership(groupId, req.userId);
-    if (existing) return res.json({ message: 'Already a member', group_id: groupId, group_name: groupRows[0].name });
+    const groupId = codeDoc.data().groupId;
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    if (!groupDoc.exists) return res.status(404).json({ error: 'Invalid or expired invite link' });
+    const group = groupDoc.data();
 
-    await pool.query(
-      'INSERT INTO group_members (group_id, user_id, role) VALUES (?, ?, ?)',
-      [groupId, req.userId, 'member']
-    );
-    res.json({ message: 'Joined group', group_id: groupId, group_name: groupRows[0].name });
+    const existing = await getMembership(groupId, req.uid);
+    if (existing) return res.json({ message: 'Already a member', group_id: groupId, group_name: group.name });
+
+    await addMember(groupRef, req.uid, 'member');
+    res.json({ message: 'Joined group', group_id: groupId, group_name: group.name });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -179,19 +277,17 @@ router.post('/invite/:code/join', auth, async (req, res) => {
 
 // ─── GET /api/groups/:id/invite ─── get invite code (members only) ─────────
 router.get('/:id/invite', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership) return res.status(403).json({ error: 'You must be a member to view the invite link' });
 
-    const [groupRows] = await pool.query('SELECT invite_code FROM "groups" WHERE id = ?', [groupId]);
-    if (!groupRows[0]) return res.status(404).json({ error: 'Group not found' });
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    if (!groupDoc.exists) return res.status(404).json({ error: 'Group not found' });
 
-    let code = groupRows[0].invite_code;
-    if (!code) {
-      code = generateInviteCode();
-      await pool.query('UPDATE "groups" SET invite_code = ? WHERE id = ?', [code, groupId]);
-    }
+    let code = groupDoc.data().inviteCode;
+    if (!code) code = await regenerateInviteCode(groupRef);
     res.json({ invite_code: code });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -201,14 +297,13 @@ router.get('/:id/invite', auth, async (req, res) => {
 
 // ─── POST /api/groups/:id/invite/regenerate ─── owner/admin only ───────────
 router.post('/:id/invite/regenerate', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership || !['owner', 'admin'].includes(membership.role))
       return res.status(403).json({ error: 'Only owners and admins can regenerate the invite link' });
 
-    const newCode = generateInviteCode();
-    await pool.query('UPDATE "groups" SET invite_code = ? WHERE id = ?', [newCode, groupId]);
+    const newCode = await regenerateInviteCode(db.collection('groups').doc(groupId));
     res.json({ invite_code: newCode });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -218,22 +313,29 @@ router.post('/:id/invite/regenerate', auth, async (req, res) => {
 
 // ─── GET /api/groups/:id/members ─── list all members with roles ──────────
 router.get('/:id/members', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership) return res.status(403).json({ error: 'Not a member of this group' });
 
-    const [rows] = await pool.query(
-      `SELECT u.id AS user_id, u.username, u.ai_avatar, gm.role, gm.joined_at
-       FROM group_members gm
-       JOIN users u ON u.id = gm.user_id
-       WHERE gm.group_id = ?
-       ORDER BY
-         CASE gm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
-         gm.joined_at ASC`,
-      [groupId]
-    );
-    res.json(rows);
+    const snap = await db.collection('groups').doc(groupId).collection('members').get();
+    const rolePriority = { owner: 0, admin: 1, member: 2 };
+    const members = snap.docs
+      .map(doc => {
+        const d = doc.data();
+        return {
+          user_id: doc.id,
+          username: d.username,
+          ai_avatar: d.ai_avatar || null,
+          role: d.role,
+          joined_at: toISO(d.joinedAt),
+        };
+      })
+      .sort((a, b) =>
+        (rolePriority[a.role] ?? 3) - (rolePriority[b.role] ?? 3) ||
+        (a.joined_at || '').localeCompare(b.joined_at || '')
+      );
+    res.json(members);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -242,15 +344,15 @@ router.get('/:id/members', auth, async (req, res) => {
 
 // ─── PATCH /api/groups/:id/members/:userId/role ─── promote/demote ─────────
 router.patch('/:id/members/:userId/role', auth, async (req, res) => {
-  const groupId  = parseInt(req.params.id);
-  const targetId = parseInt(req.params.userId);
+  const groupId  = req.params.id;
+  const targetId = req.params.userId;
   const { role }  = req.body;
 
   if (!['admin', 'member'].includes(role))
     return res.status(400).json({ error: 'Role must be admin or member' });
 
   try {
-    const requester = await getMembership(groupId, req.userId);
+    const requester = await getMembership(groupId, req.uid);
     if (!requester || requester.role !== 'owner')
       return res.status(403).json({ error: 'Only the group owner can change member roles' });
 
@@ -259,10 +361,7 @@ router.patch('/:id/members/:userId/role', auth, async (req, res) => {
     if (target.role === 'owner')
       return res.status(403).json({ error: "You can't change the owner's role" });
 
-    await pool.query(
-      'UPDATE group_members SET role = ? WHERE group_id = ? AND user_id = ?',
-      [role, groupId, targetId]
-    );
+    await db.collection('groups').doc(groupId).collection('members').doc(targetId).update({ role });
     res.json({ message: `Member ${role === 'admin' ? 'promoted to admin' : 'demoted to member'}` });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -272,15 +371,15 @@ router.patch('/:id/members/:userId/role', auth, async (req, res) => {
 
 // ─── DELETE /api/groups/:id/members/:userId ─── kick a member ──────────────
 router.delete('/:id/members/:userId', auth, async (req, res) => {
-  const groupId  = parseInt(req.params.id);
-  const targetId = parseInt(req.params.userId);
+  const groupId  = req.params.id;
+  const targetId = req.params.userId;
 
   try {
-    const requester = await getMembership(groupId, req.userId);
+    const requester = await getMembership(groupId, req.uid);
     if (!requester || !['owner', 'admin'].includes(requester.role))
       return res.status(403).json({ error: 'Only owners and admins can remove members' });
 
-    if (targetId === req.userId)
+    if (targetId === req.uid)
       return res.status(400).json({ error: 'Use "Leave group" to remove yourself' });
 
     const target = await getMembership(groupId, targetId);
@@ -292,10 +391,7 @@ router.delete('/:id/members/:userId', auth, async (req, res) => {
     if (requester.role === 'admin' && target.role === 'admin')
       return res.status(403).json({ error: 'Admins cannot remove other admins — only the owner can' });
 
-    await pool.query(
-      'DELETE FROM group_members WHERE group_id = ? AND user_id = ?',
-      [groupId, targetId]
-    );
+    await removeMember(db.collection('groups').doc(groupId), targetId);
     res.json({ message: 'Member removed' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -305,35 +401,33 @@ router.delete('/:id/members/:userId', auth, async (req, res) => {
 
 // ─── PATCH /api/groups/:id ─── edit group info (owner/admin) ───────────────
 router.patch('/:id', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   const { name, description, topic, is_private } = req.body;
 
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership || !['owner', 'admin'].includes(membership.role))
       return res.status(403).json({ error: 'Only owners and admins can edit group settings' });
 
+    const groupRef = db.collection('groups').doc(groupId);
+    const update = {};
+
     if (name && name.trim()) {
-      const [dupe] = await pool.query(
-        'SELECT id FROM "groups" WHERE LOWER(name) = LOWER(?) AND id != ?',
-        [name.trim(), groupId]
-      );
-      if (dupe.length > 0)
+      const trimmedName = name.trim();
+      const nameLower = trimmedName.toLowerCase();
+      const dupeSnap = await db.collection('groups').where('nameLower', '==', nameLower).limit(2).get();
+      if (dupeSnap.docs.some(d => d.id !== groupId))
         return res.status(409).json({ error: 'A group with this name already exists' });
+      update.name = trimmedName;
+      update.nameLower = nameLower;
     }
+    if (description !== undefined) update.description = description;
+    if (topic) update.topic = topic;
+    if (is_private != null) update.isPrivate = !!is_private;
 
-    await pool.query(
-      `UPDATE "groups" SET
-         name = COALESCE(?, name),
-         description = COALESCE(?, description),
-         topic = COALESCE(?, topic),
-         is_private = COALESCE(?, is_private)
-       WHERE id = ?`,
-      [name?.trim() || null, description ?? null, topic || null, is_private != null ? (is_private ? 1 : 0) : null, groupId]
-    );
-
-    const [updated] = await pool.query('SELECT * FROM "groups" WHERE id = ?', [groupId]);
-    res.json(updated[0]);
+    await groupRef.update(update);
+    const updated = await groupRef.get();
+    res.json(serializeGroup(updated.id, updated.data()));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -342,13 +436,24 @@ router.patch('/:id', auth, async (req, res) => {
 
 // ─── DELETE /api/groups/:id ─── delete group entirely (owner only) ─────────
 router.delete('/:id', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership || membership.role !== 'owner')
       return res.status(403).json({ error: 'Only the group owner can delete the group' });
 
-    await pool.query('DELETE FROM "groups" WHERE id = ?', [groupId]);
+    const groupRef = db.collection('groups').doc(groupId);
+    const groupDoc = await groupRef.get();
+    const inviteCode = groupDoc.data()?.inviteCode;
+
+    const memberSnap = await groupRef.collection('members').get();
+    await Promise.all(memberSnap.docs.map(doc =>
+      db.collection('users').doc(doc.id).update({ groupIds: FieldValue.arrayRemove(groupId) }).catch(() => {})
+    ));
+
+    await db.recursiveDelete(groupRef);
+    if (inviteCode) await db.collection('inviteCodes').doc(inviteCode).delete();
+
     res.json({ message: 'Group deleted' });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -358,19 +463,25 @@ router.delete('/:id', auth, async (req, res) => {
 
 // ─── GET /api/groups/:id/messages ─── message history ──────────────────────
 router.get('/:id/messages', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (!membership) return res.status(403).json({ error: 'Not a member of this group' });
 
-    const [rows] = await pool.query(
-      `SELECT m.*, u.username AS sender FROM messages m
-       JOIN users u ON u.id = m.sender_id
-       WHERE m.group_id = ?
-       ORDER BY m.created_at ASC LIMIT 200`,
-      [groupId]
-    );
-    res.json(rows);
+    const snap = await db.collection('groups').doc(groupId).collection('messages')
+      .orderBy('createdAt', 'asc').limit(200).get();
+    const messages = snap.docs.map(doc => {
+      const d = doc.data();
+      return {
+        id: doc.id,
+        sender_id: d.senderId,
+        sender: d.senderUsername,
+        group_id: groupId,
+        content: d.content,
+        created_at: toISO(d.createdAt),
+      };
+    });
+    res.json(messages);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -379,16 +490,13 @@ router.get('/:id/messages', auth, async (req, res) => {
 
 // ─── DELETE /api/groups/:id/leave ─── leave a group ─────────────────────────
 router.delete('/:id/leave', auth, async (req, res) => {
-  const groupId = parseInt(req.params.id);
+  const groupId = req.params.id;
   try {
-    const membership = await getMembership(groupId, req.userId);
+    const membership = await getMembership(groupId, req.uid);
     if (membership?.role === 'owner')
       return res.status(400).json({ error: 'Owners cannot leave — transfer ownership or delete the group instead' });
 
-    await pool.query(
-      'DELETE FROM group_members WHERE group_id = ? AND user_id = ?',
-      [groupId, req.userId]
-    );
+    if (membership) await removeMember(db.collection('groups').doc(groupId), req.uid);
     res.json({ message: 'Left group' });
   } catch (err) {
     res.status(500).json({ error: err.message });

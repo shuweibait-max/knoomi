@@ -1,55 +1,68 @@
 import { createContext, useContext, useState, useEffect } from 'react'
+import {
+  onAuthStateChanged,
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut as firebaseSignOut,
+} from 'firebase/auth'
+import { doc, onSnapshot } from 'firebase/firestore'
+import { auth, db } from '../config/firebase'
 import api from '../utils/api'
 import { connectSocket, disconnectSocket } from '../utils/socket'
 
 const AuthContext = createContext(null)
 
 export function AuthProvider({ children }) {
-  const [user, setUser]       = useState(() => JSON.parse(localStorage.getItem('mb_user') || 'null'))
-  const [loading, setLoading] = useState(true)
+  const [firebaseUser, setFirebaseUser] = useState(null)
+  const [profile, setProfile]           = useState(null)
+  const [loading, setLoading]           = useState(true)
 
+  // Single source of truth for "are we logged in" — replaces the old
+  // localStorage token bookkeeping.
   useEffect(() => {
-    const token = localStorage.getItem('mb_token')
-    if (token) {
-      api.get('/auth/me')
-        .then(r => { setUser(r.data); connectSocket() })
-        .catch(() => { localStorage.removeItem('mb_token'); localStorage.removeItem('mb_user') })
-        .finally(() => setLoading(false))
-    } else {
-      setLoading(false)
-    }
+    return onAuthStateChanged(auth, (fbUser) => {
+      setFirebaseUser(fbUser)
+      if (!fbUser) {
+        setProfile(null)
+        disconnectSocket()
+        setLoading(false)
+      }
+    })
   }, [])
 
+  // Extra profile fields (username, role, ai_name, ai_avatar) live in
+  // Firestore, not in Firebase Auth itself — keep them reactive.
+  useEffect(() => {
+    if (!firebaseUser) return
+    return onSnapshot(doc(db, 'users', firebaseUser.uid), (snap) => {
+      setProfile(snap.exists() ? { id: firebaseUser.uid, ...snap.data() } : null)
+      setLoading(false)
+      if (snap.exists()) connectSocket()
+    })
+  }, [firebaseUser])
+
   const login = async (email, password) => {
-    const { data } = await api.post('/auth/login', { email, password })
-    localStorage.setItem('mb_token', data.token)
-    localStorage.setItem('mb_user', JSON.stringify(data.user))
-    setUser(data.user)
-    connectSocket()
-    return data.user
+    await signInWithEmailAndPassword(auth, email, password)
   }
 
   const register = async (username, email, password, role = 'user') => {
-    const { data } = await api.post('/auth/register', { username, email, password, role })
-    localStorage.setItem('mb_token', data.token)
-    localStorage.setItem('mb_user', JSON.stringify(data.user))
-    setUser(data.user)
-    connectSocket()
+    await createUserWithEmailAndPassword(auth, email, password)
+    const { data } = await api.post('/auth/profile-init', { username, role })
+    // Set immediately so `user` is correct as soon as register() resolves,
+    // rather than waiting on the Firestore listener round-trip.
+    setProfile(data.user)
     return data.user
   }
 
-  const logout = () => {
-    localStorage.removeItem('mb_token')
-    localStorage.removeItem('mb_user')
-    disconnectSocket()
-    setUser(null)
+  const logout = async () => {
+    await firebaseSignOut(auth)
   }
 
   const updateUser = (updatedFields) => {
-    const merged = { ...user, ...updatedFields }
-    localStorage.setItem('mb_user', JSON.stringify(merged))
-    setUser(merged)
+    setProfile(prev => (prev ? { ...prev, ...updatedFields } : prev))
   }
+
+  const user = firebaseUser && profile ? { ...profile, email: firebaseUser.email } : null
 
   return (
     <AuthContext.Provider value={{ user, loading, login, register, logout, updateUser }}>

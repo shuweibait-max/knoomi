@@ -5,11 +5,12 @@
 //  Runs nightly at 00:00 (server time). For each user with any
 //  activity that day (AI chat OR logged mood), Gemini reads the
 //  full context and outputs { score: 1-10, note: '...' }.
-//  The result overwrites the user's mood_entries for that day
+//  The result overwrites the user's mood entries for that day
 //  (or inserts one if none existed).
 // ============================================================
 
 const { GoogleGenAI } = require('@google/genai');
+const { admin } = require('../config/firebase');
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL = 'gemini-2.5-flash';
@@ -33,46 +34,48 @@ Rules:
 - If crisis content was detected in chat, the score MUST be 1 or 2.
 - Output ONLY the JSON object. No preamble. No markdown fencing. Just: {"score": N, "note": "..."}`;
 
+// Firestore range queries need concrete boundary Dates rather than SQL's
+// DATE(logged_at) = DATE(?) truncation — this derives the same UTC calendar
+// day boundaries from whatever Date is passed in.
+function dayRangeUTC(date) {
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 0, 0, 0, 0));
+  const end   = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999));
+  return { start, end };
+}
+
 
 /**
  * Judges a single user's mood for the given date using their day's data.
  * Returns { score, note } or null if there wasn't enough data to judge.
  */
-async function judgeUserMoodForDay(pool, userId, date) {
+async function judgeUserMoodForDay(db, uid, date) {
+  const { start, end } = dayRangeUTC(date);
+
   // Fetch AI chat messages for this user on this date
-  const [chatRows] = await pool.query(
-    `SELECT content, is_ai FROM messages
-     WHERE sender_id = ?
-       AND group_id IS NULL
-       AND DATE(created_at) = DATE(?)
-     ORDER BY created_at ASC`,
-    [userId, date]
-  );
+  const chatSnap = await db.collection('users').doc(uid).collection('aiMessages')
+    .where('createdAt', '>=', start).where('createdAt', '<=', end)
+    .orderBy('createdAt', 'asc').get();
 
   // Fetch any mood entries logged this day
-  const [moodRows] = await pool.query(
-    `SELECT score, note FROM mood_entries
-     WHERE user_id = ?
-       AND DATE(logged_at) = DATE(?)
-     ORDER BY logged_at ASC`,
-    [userId, date]
-  );
+  const moodSnap = await db.collection('users').doc(uid).collection('moodEntries')
+    .where('loggedAt', '>=', start).where('loggedAt', '<=', end)
+    .orderBy('loggedAt', 'asc').get();
 
   // Skip users with no activity at all today
-  if (chatRows.length === 0 && moodRows.length === 0) {
+  if (chatSnap.empty && moodSnap.empty) {
     return null;
   }
 
   // Build the context payload sent to Gemini
-  const chatTranscript = chatRows.length > 0
-    ? chatRows
-        .map(m => `${m.is_ai ? 'Mira' : 'User'}: ${m.content}`)
+  const chatTranscript = !chatSnap.empty
+    ? chatSnap.docs
+        .map(d => `${d.data().isAi ? 'Mira' : 'User'}: ${d.data().content}`)
         .join('\n')
     : '(no chat messages today)';
 
-  const loggedMoods = moodRows.length > 0
-    ? moodRows
-        .map(m => `Score ${m.score}/10${m.note ? ` — "${m.note}"` : ''}`)
+  const loggedMoods = !moodSnap.empty
+    ? moodSnap.docs
+        .map(d => `Score ${d.data().score}/10${d.data().note ? ` — "${d.data().note}"` : ''}`)
         .join('\n')
     : '(no mood logged manually today)';
 
@@ -106,7 +109,7 @@ Now output the JSON judgement.`.trim();
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim();
     parsed = JSON.parse(cleaned);
   } catch (err) {
-    console.error(`[moodJudge] Failed to parse JSON for user ${userId}:`, raw);
+    console.error(`[moodJudge] Failed to parse JSON for user ${uid}:`, raw);
     return null;
   }
 
@@ -114,7 +117,7 @@ Now output the JSON judgement.`.trim();
   const note  = String(parsed.note || '').slice(0, 250);
 
   if (isNaN(score) || score < 1 || score > 10) {
-    console.error(`[moodJudge] Invalid score for user ${userId}:`, parsed);
+    console.error(`[moodJudge] Invalid score for user ${uid}:`, parsed);
     return null;
   }
 
@@ -123,24 +126,50 @@ Now output the JSON judgement.`.trim();
 
 
 /**
- * Writes an AI-judged mood entry to the database.
+ * Writes an AI-judged mood entry to Firestore.
  * If the user already has entries for this date, deletes them first
  * so the AI judgement is the single source of truth for that day.
  */
-async function writeMoodJudgement(pool, userId, date, judgement) {
-  // Delete any existing mood entries for this user on this date
-  await pool.query(
-    `DELETE FROM mood_entries
-     WHERE user_id = ? AND DATE(logged_at) = DATE(?)`,
-    [userId, date]
-  );
+async function writeMoodJudgement(db, uid, date, judgement) {
+  const { start, end } = dayRangeUTC(date);
+  const moodRef = db.collection('users').doc(uid).collection('moodEntries');
 
-  // Insert the AI-judged entry, dated to the target day
-  await pool.query(
-    `INSERT INTO mood_entries (user_id, score, note, logged_at)
-     VALUES (?, ?, ?, ?)`,
-    [userId, judgement.score, judgement.note, date]
-  );
+  const existingSnap = await moodRef.where('loggedAt', '>=', start).where('loggedAt', '<=', end).get();
+
+  const batch = db.batch();
+  existingSnap.docs.forEach(doc => batch.delete(doc.ref));
+  batch.set(moodRef.doc(), {
+    score: judgement.score,
+    note: judgement.note,
+    loggedAt: admin.firestore.Timestamp.fromDate(date),
+  });
+  await batch.commit();
+}
+
+
+/**
+ * Finds every user with AI chat or mood activity on the given date.
+ * Iterates all users rather than a collection-group query, since a
+ * collection-group query here would need a manually provisioned Firestore
+ * index that isn't available in this environment — acceptable at this
+ * app's current user-count scale.
+ */
+async function findActiveUids(db, date) {
+  const { start, end } = dayRangeUTC(date);
+  const usersSnap = await db.collection('users').get();
+  const activeUids = [];
+
+  for (const userDoc of usersSnap.docs) {
+    const uid = userDoc.id;
+    const [chatSnap, moodSnap] = await Promise.all([
+      db.collection('users').doc(uid).collection('aiMessages')
+        .where('createdAt', '>=', start).where('createdAt', '<=', end).limit(1).get(),
+      db.collection('users').doc(uid).collection('moodEntries')
+        .where('loggedAt', '>=', start).where('loggedAt', '<=', end).limit(1).get(),
+    ]);
+    if (!chatSnap.empty || !moodSnap.empty) activeUids.push(uid);
+  }
+  return activeUids;
 }
 
 
@@ -148,7 +177,7 @@ async function writeMoodJudgement(pool, userId, date, judgement) {
  * Main entry: run the judgement for all active users for the given date.
  * If no date is passed, uses "yesterday" (which is what the midnight job wants).
  */
-async function runDailyMoodJudgement(pool, targetDate = null) {
+async function runDailyMoodJudgement(db, targetDate = null) {
   const date = targetDate || (() => {
     const d = new Date();
     d.setDate(d.getDate() - 1);   // yesterday, since job runs at 00:00
@@ -158,38 +187,26 @@ async function runDailyMoodJudgement(pool, targetDate = null) {
 
   console.log(`[moodJudge] Starting daily mood judgement for ${date.toISOString().slice(0, 10)}`);
 
-  // Get all users who had activity on this date (chat OR mood)
-  const [activeUsers] = await pool.query(
-    `SELECT DISTINCT user_id FROM (
-       SELECT sender_id AS user_id FROM messages
-       WHERE group_id IS NULL AND DATE(created_at) = DATE(?)
-       UNION
-       SELECT user_id FROM mood_entries
-       WHERE DATE(logged_at) = DATE(?)
-     ) AS active`,
-    [date, date]
-  );
-
-  console.log(`[moodJudge] Found ${activeUsers.length} active user(s) to judge.`);
+  const activeUids = await findActiveUids(db, date);
+  console.log(`[moodJudge] Found ${activeUids.length} active user(s) to judge.`);
 
   let succeeded = 0;
   let skipped   = 0;
   let failed    = 0;
 
-  for (const row of activeUsers) {
-    const userId = row.user_id;
+  for (const uid of activeUids) {
     try {
-      const judgement = await judgeUserMoodForDay(pool, userId, date);
+      const judgement = await judgeUserMoodForDay(db, uid, date);
       if (!judgement) {
         skipped++;
         continue;
       }
-      await writeMoodJudgement(pool, userId, date, judgement);
+      await writeMoodJudgement(db, uid, date, judgement);
       succeeded++;
-      console.log(`[moodJudge] ✓ user ${userId} → score ${judgement.score}/10`);
+      console.log(`[moodJudge] ✓ user ${uid} → score ${judgement.score}/10`);
     } catch (err) {
       failed++;
-      console.error(`[moodJudge] ✗ user ${userId}:`, err.message);
+      console.error(`[moodJudge] ✗ user ${uid}:`, err.message);
     }
   }
 

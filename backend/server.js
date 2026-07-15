@@ -4,9 +4,7 @@ const http       = require('http');
 const { Server } = require('socket.io');
 const cors       = require('cors');
 const path       = require('path');
-const jwt        = require('jsonwebtoken');
-const pool       = require('./config/db');
-const initDB     = require('./config/initDB');
+const { auth: firebaseAuth, db } = require('./config/firebase');
 
 const adminRoutes         = require('./routes/admin');
 const authRoutes          = require('./routes/auth');
@@ -65,87 +63,42 @@ if (require('fs').existsSync(frontendBuild)) {
 }
 
 // ── Socket.IO ─────────────────────────────────────────────────────────────────
-function getUserFromToken(token) {
-  try { return jwt.verify(token, process.env.JWT_SECRET); }
+// Chat (group + direct messages) now goes straight to Firestore — the client
+// writes messages directly and listens via onSnapshot, enforced by Firestore
+// security rules, rather than round-tripping through this socket server.
+// Socket.IO's only remaining job is the ephemeral `typing` indicator, which
+// doesn't belong in Firestore (a write per keystroke would be wasteful).
+async function getUserFromToken(token) {
+  try { return await firebaseAuth.verifyIdToken(token); }
   catch { return null; }
 }
 
 io.on('connection', (socket) => {
-  socket.on('connect_user', ({ token }) => {
-    const user = getUserFromToken(token);
+  socket.on('connect_user', async ({ token }) => {
+    const user = await getUserFromToken(token);
     if (!user) return;
-    socket.join(`user_${user.userId}`);
-    socket.userId   = user.userId;
-    socket.username = user.username;
+    socket.join(`user_${user.uid}`);
+    socket.uid  = user.uid;
+    socket.name = user.name || user.email;
   });
 
-  socket.on('send_direct_message', async ({ token, receiver_id, content }) => {
-    const user = getUserFromToken(token);
-    if (!user || !content?.trim()) return;
-    try {
-      const [result] = await pool.query(
-        'INSERT INTO messages (sender_id, receiver_id, content, is_ai) VALUES (?, ?, ?, 0)',
-        [user.userId, receiver_id, content]
-      );
-      const [rows] = await pool.query(
-        `SELECT m.*, u.username AS sender FROM messages m
-         JOIN users u ON u.id = m.sender_id WHERE m.id = ?`,
-        [result.insertId]
-      );
-      const msg = rows[0];
-      io.to(`user_${user.userId}`).emit('new_direct_message', msg);
-      io.to(`user_${receiver_id}`).emit('new_direct_message', msg);
-    } catch (err) { socket.emit('error', { message: err.message }); }
-  });
-
-  socket.on('join_group_room', async ({ token, group_id }) => {
-    const user = getUserFromToken(token);
-    if (!user) return;
-    const [member] = await pool.query(
-      'SELECT id FROM group_members WHERE group_id = ? AND user_id = ?',
-      [group_id, user.userId]
-    );
-    if (!member.length) { socket.emit('error', { message: 'Not a member' }); return; }
+  // Plain room join/leave for scoping the `typing` broadcast — no membership
+  // check here since access to the group chat UI already required it
+  // (enforced by the Firestore-backed groups API), and this only controls
+  // who sees a "someone is typing" event, not message content.
+  socket.on('join_group_room', ({ group_id }) => {
     socket.join(`group_${group_id}`);
-    const [uRows] = await pool.query('SELECT username FROM users WHERE id = ?', [user.userId]);
-    io.to(`group_${group_id}`).emit('system_message', { content: `${uRows[0]?.username} joined` });
   });
 
-  socket.on('leave_group_room', async ({ token, group_id }) => {
-    const user = getUserFromToken(token);
-    if (!user) return;
+  socket.on('leave_group_room', ({ group_id }) => {
     socket.leave(`group_${group_id}`);
-    const [uRows] = await pool.query('SELECT username FROM users WHERE id = ?', [user.userId]);
-    io.to(`group_${group_id}`).emit('system_message', { content: `${uRows[0]?.username} left` });
   });
 
-  socket.on('send_group_message', async ({ token, group_id, content }) => {
-    const user = getUserFromToken(token);
-    if (!user || !content?.trim()) return;
-    const [member] = await pool.query(
-      'SELECT id FROM group_members WHERE group_id = ? AND user_id = ?',
-      [group_id, user.userId]
-    );
-    if (!member.length) return;
-    try {
-      const [result] = await pool.query(
-        'INSERT INTO messages (sender_id, group_id, content) VALUES (?, ?, ?)',
-        [user.userId, group_id, content]
-      );
-      const [rows] = await pool.query(
-        `SELECT m.*, u.username AS sender FROM messages m
-         JOIN users u ON u.id = m.sender_id WHERE m.id = ?`,
-        [result.insertId]
-      );
-      io.to(`group_${group_id}`).emit('new_group_message', rows[0]);
-    } catch (err) { socket.emit('error', { message: err.message }); }
-  });
-
-  socket.on('typing', ({ token, group_id, receiver_id }) => {
-    const user = getUserFromToken(token);
+  socket.on('typing', async ({ token, group_id, receiver_id }) => {
+    const user = await getUserFromToken(token);
     if (!user) return;
     const room = group_id ? `group_${group_id}` : `user_${receiver_id}`;
-    socket.to(room).emit('user_typing', { username: user.username || 'Someone' });
+    socket.to(room).emit('user_typing', { username: user.name || user.email || 'Someone' });
   });
 });
 
@@ -153,7 +106,7 @@ io.on('connection', (socket) => {
 cron.schedule('0 0 * * *', async () => {
   console.log('⏰ Midnight mood judgement job triggered');
   try {
-    await runDailyMoodJudgement(pool);
+    await runDailyMoodJudgement(db);
   } catch (err) {
     console.error('❌ Mood judgement job failed:', err);
   }
@@ -167,7 +120,7 @@ console.log('📅 Daily mood judgement scheduled for 00:00 Asia/Kuala_Lumpur');
 app.post('/api/admin/run-mood-judgement', async (req, res) => {
   try {
     const targetDate = req.body?.date ? new Date(req.body.date) : null;
-    const result = await runDailyMoodJudgement(pool, targetDate);
+    const result = await runDailyMoodJudgement(db, targetDate);
     res.json({ message: 'Judgement complete', ...result });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -176,8 +129,4 @@ app.post('/api/admin/run-mood-judgement', async (req, res) => {
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-initDB()
-  .then(() => server.listen(PORT, () =>
-    console.log(`🌿 Knoomi API running on http://localhost:${PORT}`)
-  ))
-  .catch(err => { console.error('❌ Database init failed:', err); process.exit(1); });
+server.listen(PORT, () => console.log(`🌿 Knoomi API running on http://localhost:${PORT}`));
