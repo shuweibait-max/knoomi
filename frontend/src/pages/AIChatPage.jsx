@@ -33,6 +33,49 @@ function Bubble({ msg, username, aiAvatar }) {
   )
 }
 
+// ─── Mood proposal confirm chip ─────────────────────────────
+// The agent's propose_mood_log tool never writes anything itself — this is
+// the confirmation step that turns a proposal into a real POST /api/mood.
+function MoodProposalChip({ proposal }) {
+  const [status, setStatus] = useState('pending') // pending | saving | confirmed | dismissed
+
+  const confirm = async () => {
+    setStatus('saving')
+    try {
+      await api.post('/mood/', { score: proposal.score, note: proposal.note })
+      setStatus('confirmed')
+    } catch {
+      setStatus('pending')
+    }
+  }
+
+  const dismiss = () => setStatus('dismissed')
+
+  if (status === 'dismissed') return null
+
+  return (
+    <div className="ml-11 mt-1.5 max-w-[70%]">
+      <div className="bg-brand-50 border border-brand-100 rounded-xl px-3 py-2.5 text-xs">
+        {status === 'confirmed' ? (
+          <span className="text-brand-700 font-medium">✓ Logged {proposal.score}/10</span>
+        ) : (
+          <>
+            <div className="text-slate-600 mb-2">Log mood as <strong>{proposal.score}/10</strong>{proposal.note ? ` — "${proposal.note}"` : ''}?</div>
+            <div className="flex gap-2">
+              <button onClick={confirm} disabled={status === 'saving'} className="btn-primary btn-sm px-3 py-1">
+                {status === 'saving' ? 'Saving…' : 'Log it'}
+              </button>
+              <button onClick={dismiss} disabled={status === 'saving'} className="btn-secondary btn-sm px-3 py-1">
+                No thanks
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  )
+}
+
 
 // ─── Customize Modal ──────────────────────────────────────
 function CustomizeModal({ currentName, currentAvatar, onClose, onSave }) {
@@ -195,9 +238,9 @@ export default function AIChatPage() {
     setLoading(true)
     try {
       const { data } = await api.post('/chat/ai', { message: content })
-      setMessages(m => [...m, { id: data.message_id, content: data.reply, is_ai: true }])
+      setMessages(m => [...m, { id: Date.now() + 1, content: data.message, is_ai: true, moodProposal: data.moodProposal || null }])
     } catch {
-      setMessages(m => [...m, { id: Date.now(), content: 'Sorry, I had trouble responding. Please try again.', is_ai: true }])
+      setMessages(m => [...m, { id: Date.now() + 1, content: 'Sorry, I had trouble responding. Please try again.', is_ai: true }])
     } finally { setLoading(false) }
   }
 
@@ -244,7 +287,12 @@ export default function AIChatPage() {
       <div className="flex-1 overflow-y-auto px-5 py-5 space-y-4">
         {fetching && <p className="text-center text-slate-400 text-sm">Loading…</p>}
 
-        {messages.map(msg => <Bubble key={msg.id} msg={msg} username={user?.username} aiAvatar={aiAvatar} />)}
+        {messages.map(msg => (
+          <div key={msg.id}>
+            <Bubble msg={msg} username={user?.username} aiAvatar={aiAvatar} />
+            {msg.moodProposal && <MoodProposalChip proposal={msg.moodProposal} />}
+          </div>
+        ))}
 
         {/* Typing dots — for both welcome AND regular responses */}
         {(welcoming || loading) && (

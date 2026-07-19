@@ -41,6 +41,15 @@ service cloud.firestore {
       match /aiMessages/{messageId} {
         allow read, write: if isSelf(uid);
       }
+
+      // Durable facts Mira's CONSOLIDATE stage extracts — sensitive
+      // personal data, backend (Admin SDK) writes only. Being a
+      // subcollection under users/{uid} means it's swept up for free by
+      // whatever recursive-delete handles account deletion.
+      match /miraMemory/{factId} {
+        allow read: if isSelf(uid) || isAdminOrTherapist();
+        allow write: if false;
+      }
     }
 
     // ── username uniqueness lookup — backend only ───────────
@@ -91,6 +100,15 @@ service cloud.firestore {
     match /videoSessions/{sessionId} {
       allow read: if isSignedIn() &&
         (resource.data.hostId == request.auth.uid || resource.data.participantId == request.auth.uid);
+      allow write: if false;
+    }
+
+    // ── crisis flags — audit trail, admin/therapist review only ─
+    // Independent of chat content on purpose (per Mira agent design) so
+    // it can be reviewed/audited without needing access to the full
+    // conversation. Backend (Admin SDK) writes only.
+    match /crisisFlags/{id} {
+      allow read: if isAdminOrTherapist();
       allow write: if false;
     }
   }

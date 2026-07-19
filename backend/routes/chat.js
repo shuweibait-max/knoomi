@@ -2,13 +2,7 @@ const express = require('express');
 const { GoogleGenAI } = require('@google/genai');
 const { db, admin } = require('../config/firebase');
 const auth = require('../middleware/auth');
-const {
-  buildSystemPrompt,
-  buildMessages,
-  detectCrisis,
-  loadUserContext,
-  CRISIS_HOTLINES,
-} = require('../services/promptEngine');
+const { runMiraAgent } = require('../services/miraAgent');
 const {
   detectMoodShift,
   shouldRunDetection,
@@ -19,23 +13,6 @@ const router = express.Router();
 const ai     = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 const MODEL  = 'gemini-2.5-flash';
 const FieldValue = admin.firestore.FieldValue;
-
-
-function convertToGeminiFormat(messages) {
-  let systemInstruction = '';
-  const contents = [];
-  for (const msg of messages) {
-    if (msg.role === 'system') {
-      systemInstruction += (systemInstruction ? '\n\n' : '') + msg.content;
-    } else {
-      contents.push({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }],
-      });
-    }
-  }
-  return { systemInstruction, contents };
-}
 
 // Deterministic path for a 1:1 DM thread between two uids.
 function dmId(uidA, uidB) {
@@ -50,60 +27,35 @@ router.post('/ai', auth, async (req, res) => {
     return res.status(400).json({ error: 'Message cannot be empty' });
 
   try {
-    // 1. Crisis detection on user's message
-    const { isCrisis, matchedKeywords } = detectCrisis(message);
-    if (isCrisis) {
-      console.log(`[CRISIS DETECTED] user=${req.uid}, keywords=${matchedKeywords.join(', ')}`);
-    }
-
     const aiMessagesRef = db.collection('users').doc(req.uid).collection('aiMessages');
 
-    // 2. Save user message
-    await aiMessagesRef.add({ content: message, isAi: false, createdAt: FieldValue.serverTimestamp() });
+    // Snapshot history BEFORE this turn's messages are written, for the
+    // mood-shift detector below (it wants the pre-turn window plus this
+    // turn's exchange, same contract as before the agent rewrite).
+    const priorHistorySnap = await aiMessagesRef.orderBy('createdAt', 'desc').limit(20).get();
+    const priorHistoryDocs = priorHistorySnap.docs.map(d => d.data()).reverse();
 
-    // 3. Load personalisation context
-    const context = await loadUserContext(db, req.uid);
+    const agentResult = await runMiraAgent({ db, uid: req.uid, message });
+    const { reply, sessionId, intent, isCrisis, matchedKeywords, moodProposal, toolTrace, latencyMs } = agentResult;
 
-    // 4. Fetch recent history
-    const historySnap = await aiMessagesRef.orderBy('createdAt', 'desc').limit(20).get();
-    const historyDocs = historySnap.docs.map(d => d.data()).reverse();
-    const history = historyDocs.map(m => ({ role: m.isAi ? 'assistant' : 'user', content: m.content }));
-
-    // 5. Build prompt & call Gemini
-    const systemPrompt = buildSystemPrompt(context);
-    const openAIStyleMessages = buildMessages(systemPrompt, history, message, isCrisis);
-    const { systemInstruction, contents } = convertToGeminiFormat(openAIStyleMessages);
-
-    const response = await ai.models.generateContent({
-      model: MODEL,
-      contents,
-      config: {
-        systemInstruction,
-        temperature: 0.75,
-        maxOutputTokens: 600,
-      },
+    // Persist both sides of the turn.
+    await aiMessagesRef.add({ content: message, isAi: false, sessionId, createdAt: FieldValue.serverTimestamp() });
+    const replyRef = await aiMessagesRef.add({
+      content: reply, isAi: true, intent, sessionId, createdAt: FieldValue.serverTimestamp(),
     });
 
-    let reply = response.text?.trim() || "I'm here — could you tell me a bit more about what's on your mind?";
-
-    if (isCrisis && !reply.includes('Befrienders') && !reply.includes('Talian Kasih')) {
-      reply = `${reply}\n\n---\n${CRISIS_HOTLINES}`;
-    }
-
-    // 6. Save AI reply
-    const replyRef = await aiMessagesRef.add({ content: reply, isAi: true, createdAt: FieldValue.serverTimestamp() });
-
-    // 7. ─── MOOD SHIFT DETECTION ─────────────────────────
-    let shiftNotification = null;
-
+    // ─── MOOD SHIFT DETECTION ───────────────────────────────
+    // Unchanged from before the agent rewrite — a separate concern from
+    // the agent's own CONSOLIDATE stage (durable facts vs. in-conversation
+    // emotional deterioration). Still writes to the `notifications`
+    // collection for the user/admin notification feeds.
     const historyForDetection = [
-      ...historyDocs.map(m => ({ content: m.content, is_ai: m.isAi })),
+      ...priorHistoryDocs.map(m => ({ content: m.content, is_ai: m.isAi })),
       { content: message, is_ai: false },
-      { content: reply,   is_ai: true },
+      { content: reply, is_ai: true },
     ];
 
     const shouldCheck = isCrisis || shouldRunDetection(historyForDetection);
-
     if (shouldCheck) {
       const shift = isCrisis
         ? { severity: 'urgent', from_mood: 5, to_mood: 2, signals: matchedKeywords.slice(0, 3), summary: "I'm really glad you reached out. What you're feeling right now matters — you don't have to face this alone." }
@@ -111,16 +63,21 @@ router.post('/ai', auth, async (req, res) => {
 
       if (shift) {
         console.log(`[MOOD SHIFT] user=${req.uid}, severity=${shift.severity}, ${shift.from_mood}→${shift.to_mood}`);
-        shiftNotification = await createShiftNotifications(db, req.uid, shift, isCrisis);
+        await createShiftNotifications(db, req.uid, shift, isCrisis);
       }
     }
 
-    res.json({
-      reply,
-      message_id: replyRef.id,
-      is_crisis:  isCrisis,
-      shift_notification: shiftNotification,   // frontend can show this inline
-    });
+    const responseBody = {
+      message: reply,
+      sessionId,
+      isCrisis,
+      moodProposal,
+    };
+    if (process.env.NODE_ENV !== 'production') {
+      responseBody._agent = { intent, reason: null, toolTrace, latencyMs, messageId: replyRef.id };
+    }
+
+    res.json(responseBody);
 
   } catch (err) {
     console.error('AI chat error:', err);
@@ -141,6 +98,7 @@ router.get('/ai/history', auth, async (req, res) => {
         sender_id: req.uid,
         content: d.content,
         is_ai: d.isAi,
+        intent: d.intent || null,
         created_at: d.createdAt?.toDate ? d.createdAt.toDate().toISOString() : d.createdAt,
       };
     });
@@ -186,10 +144,9 @@ router.post('/ai/welcome', auth, async (req, res) => {
       return res.json({ welcome: null, already_welcomed: true });
     }
 
-    // Load context so we can personalise (name + AI name if you have that)
-    const context = await loadUserContext(db, req.uid);
-    const aiName   = context.aiName   || 'Mira';
-    const userName = context.userName || 'there';
+    const userDoc = await db.collection('users').doc(req.uid).get();
+    const aiName   = userDoc.data()?.ai_name || 'Mira';
+    const userName = userDoc.data()?.username || 'there';
 
     // Build a short, warm welcome prompt
     const welcomeSystemPrompt = `You are ${aiName}, a warm and compassionate AI companion on Knoomi — a mental health platform for young adults in Malaysia and Southeast Asia.
